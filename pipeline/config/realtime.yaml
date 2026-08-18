@@ -1,0 +1,125 @@
+# Real-time speech -> reasoning -> speech pipeline.
+#
+# Each stage runs as a subprocess in its own venv (the three model stacks have
+# mutually incompatible transformers pins), speaking JSON-lines over stdin/stdout.
+
+capture:
+  device: default          # null/default = system default input
+  sample_rate: 16000
+  frame_ms: 20
+  vad:
+    backend: webrtc        # webrtc | energy  (webrtc needs the webrtcvad package)
+    aggressiveness: 2      # webrtc only, 0-3; raise in noisy rooms
+    calibration_s: 1.0     # noise-floor sampling at startup
+    noise_margin: 6.0      # energy gate: threshold = noise_floor * margin
+    min_threshold: 0.015   # absolute floor, so a quiet room cannot self-trigger
+    silence_ms: 600
+    min_utterance_ms: 300
+    max_utterance_ms: 15000
+    pre_roll_ms: 300
+
+queues:
+  audio_queue:       { maxsize: 8,  on_full: drop_oldest }
+  transcript_queue:  { maxsize: 32, on_full: block }
+  reply_queue:       { maxsize: 32, on_full: block }
+  wav_queue:         { maxsize: 8,  on_full: block }
+
+stt:
+  python: venv/Scripts/python.exe          # root venv
+  worker: pipeline/workers/worker_stt.py
+  model_dir: stt/models
+  device: cuda
+  require_cuda: true
+
+llm:
+  python: reasoning/venv/Scripts/python.exe
+  worker: pipeline/workers/worker_llm.py
+  model_dir: reasoning/models/gemma-3-4b-it
+  device: cuda
+  require_cuda: true
+  load_in_4bit: true       # ~3GB instead of ~8GB, so all three models fit in 12GB
+  # The prompt asks for short replies; this decides. Every token here is also
+  # ~0.5s of TTS synthesis, so it is the main latency lever too.
+  max_new_tokens: 96
+  temperature: 0.6         # lower than default for steadier instruction-following
+  prompt_file: pipeline/config/prompts/voice_assistant.md
+  # Reply in the language the user spoke. The prompt asks for this; a 4B model
+  # ignores it under load, so the language is detected from the transcript and
+  # stated to the model explicitly each turn. Switching language also clears
+  # history, since prior turns pull the reply back to the old language.
+  enforce_language: true
+  history_turns: 4         # conversation turns kept as context (0 = stateless)
+  history_ttl_s: 300       # clear history this long after the last exchange (0 = never)
+
+tts:
+  python: tts/venv/Scripts/python.exe
+  worker: pipeline/workers/worker_tts.py
+  # Piper is a small VITS synthesizer running on CPU via onnxruntime, so it
+  # leaves the GPU entirely to STT and the LLM.
+  device: cpu
+  require_cuda: false
+  voices_dir: tts/models/export
+  default_language: english
+  # A Piper voice IS a language — there is no single model to condition, so the
+  # reply's detected language selects a checkpoint. Names are the export dirs
+  # created by tts/download_voices.sh.
+  #
+  # Languages absent here have no usable voice (Gujarati, Punjabi, Odia,
+  # Assamese and others). Replies in those languages are not spoken: the
+  # worker returns `no_voice` and the text is shown instead, which beats a
+  # wrong-language voice mispronouncing every word.
+  voices:
+    english: en_lessac_medium
+    # Tamil is not in the official Piper repo; ta_valluvar comes from a
+    # community repo. Swap to ta_hemalatha for the alternate voice.
+    tamil: ta_valluvar
+    # Kannada has no Piper voice at all; this one is converted from the
+    # SYSPIN (IISc) Coqui VITS checkpoint by tts/convert_coqui_to_piper.py.
+    kannada: kn_syspin
+    hindi: hi_official_v1
+    malayalam: ml_meera
+    telugu: te_maya
+    urdu: ur_fasih
+    bengali: bn_google
+    marathi: mr_google
+    nepali: ne_google
+    spanish: es_davefx
+    french: fr_siwis
+    german: de_thorsten
+    chinese: zh_huayan
+    russian: ru_irina
+    arabic: ar_kareem
+    portuguese: pt_faber
+    italian: it_paola
+    korean: ko_kss
+  # Piper's knobs. length_scale is the speed lever: >1 slower, <1 faster.
+  length_scale: 1.0
+  noise_scale: 0.667      # prosody variation; lower is flatter and steadier
+  noise_w_scale: 0.8      # phoneme-duration variation
+  # Echo reduction layer 1. The feedback loop is acoustic, so amplitude is the
+  # most effective software lever. If replies are too quiet, raise the *system*
+  # volume — a quiet signal amplified downstream keeps a better
+  # speaker-to-mic ratio than a hot signal does.
+  normalize:
+    target_lufs: -23.0     # null to disable; -16 is typical streaming loudness
+    peak: 0.7              # hard ceiling after loudness normalization
+
+echo:
+  # Layer 2: drop mic frames entirely while the assistant is audible. Airtight
+  # against self-hearing; the cost is that you cannot interrupt mid-reply.
+  mute_capture_while_replying: true
+  mute_tail_ms: 400        # speakers and room reverb ring on past the last sample
+  # Layer 5: the only layer that identifies echo rather than reducing its odds.
+  # Catches bleed that survives muting (e.g. a reply still ringing at unmute).
+  guard: true
+  threshold: 0.6           # word-overlap fraction. Lower = more aggressive.
+  window: 6                # recent replies compared against
+
+playback:
+  device: default
+  keep_wavs: false
+
+runtime:
+  spill_dir: pipeline/spill
+  log_latency: true
+  startup_timeout_s: 300   # per worker; first load compiles/quantizes and is slow
