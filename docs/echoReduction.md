@@ -4,10 +4,18 @@ How the real-time speech loop avoids replying to its own voice when it plays
 through **open speakers** instead of headphones.
 
 - Code: [echo_guard.py](../pipeline/realtime/echo_guard.py),
+  [interrupt.py](../pipeline/realtime/interrupt.py),
   [workers.py](../pipeline/realtime/workers.py),
   [capture.py](../pipeline/realtime/capture.py),
+  [audio_out.py](../pipeline/realtime/audio_out.py),
   [run_realtime.py](../pipeline/run_realtime.py)
-- Config: [realtime.yaml](../pipeline/config/realtime.yaml) (`capture.vad`, `reason.*`, `tts.normalize`)
+- Config: [realtime.yaml](../pipeline/config/realtime.yaml) (`capture.vad`, `barge_in.*`,
+  `echo.*`, `tts.normalize`)
+
+> Barge-in — interrupting a reply in progress — is the other half of this
+> problem and is documented in [bargeIn.md](bargeIn.md). The echo guard is what
+> makes it possible: it is the only layer that can tell the user's voice from the
+> assistant's own, so it is what decides whether an interrupt was real.
 
 ---
 
@@ -19,7 +27,7 @@ fixes:
 
 | Failure | What happens |
 |---|---|
-| **Self-interrupt** | Barge-in fires on the assistant's own first words, cutting its own reply short and (with `reset_memory_on_barge_in`) wiping conversation memory. |
+| **Self-interrupt** | Barge-in fires on the assistant's own first words, cutting its own reply short. |
 | **Self-reply** | The bleed is transcribed, reaches the model as a user turn, and the assistant answers itself — a runaway loop. |
 
 The root cause is that the acoustic layer has no echo cancellation. VAD
@@ -37,17 +45,19 @@ heard "I can help with that" while the assistant was in the middle of saying
 
 ## 2. Defence in depth
 
-Five independent layers. The first three reduce how much bleed exists; the
-last two catch what survives.
+Five independent layers. The first four reduce how much bleed exists; the
+last one catches what survives.
 
 ```text
                  ┌─ (1) quieter output      tts.normalize.target_lufs
-                 ├─ (2) mic muted while replying   reason.mute_capture_while_replying
-   acoustic ─────┤
-                 ├─ (3) grace window        reason.barge_in_grace_ms
-                 └─ (4) longer debounce     capture.vad.speech_start_debounce_ms
-                                 │
-   textual ──────────────────────┴─ (5) echo guard   reason.echo_guard
+                 ├─ (2) mic muted while replying   echo.mute_capture_while_replying
+   acoustic ─────┤       (or, with barge-in on, the strict gate below)
+                 ├─ (3) grace window        capture.vad.barge_in_grace_ms
+                 └─ (4) strict gate + debounce
+                 │         capture.vad.barge_in_energy_multiplier
+                 │         capture.vad.barge_in_aggressiveness
+                 │         capture.vad.barge_in_debounce_ms
+   textual ──────┴─ (5) echo guard   echo.guard
 ```
 
 ### (1) Put less energy in the room — `tts.normalize.target_lufs: -23.0`
@@ -59,38 +69,47 @@ bleed on most desk setups; `-23` is well below it.
 Turn the *system* volume up if replies are too quiet. A quiet signal amplified
 downstream keeps a better speaker-to-mic ratio than a hot signal does.
 
-### (2) Mute capture while replying — `reason.mute_capture_while_replying: true`
+### (2) Mute capture while replying — `echo.mute_capture_while_replying: true`
 
 The strongest guarantee: capture drops frames entirely while the `speaking`
-event is set, so bleed is never recorded. Note this is **mutually exclusive
-with barge-in** — a muted mic cannot hear an interruption. `run_realtime.py`
-enforces the choice: `mute_while_replying` is only enabled when `barge_in` is
-off.
+event is set, so bleed is never recorded. This is **mutually exclusive with
+barge-in** — a muted mic cannot hear an interruption — so it is ignored when
+`barge_in.enabled` is set, and layers 3–4 take over as the acoustic defence.
 
-### (3) Grace window — `reason.barge_in_grace_ms: 2000`
+### (3) Grace window — `capture.vad.barge_in_grace_ms: 350`
 
-When barge-in *is* on, ignore speech starts for this long after audio output
-begins. The opening of a reply is its loudest, most bleed-prone moment, and
-the original `900 ms` let the assistant's first words trigger a self-interrupt.
-Raised to `2000 ms`.
+Ignore speech starts for this long after audio output begins. The opening of a
+reply is its loudest, most bleed-prone moment.
 
-Cost: you cannot barge in during that window.
+Cost: you cannot barge in during that window. It is short here only because
+layer 5 can now *reverse* a false interrupt — see
+[bargeIn.md](bargeIn.md) — so a mistake in this window costs a replayed
+sentence rather than a swallowed reply.
 
-### (4) Longer speech debounce — `capture.vad.speech_start_debounce_ms: 700`
+### (4) Strict gate + debounce — `capture.vad.barge_in_*`
 
-Barge-in requires this many milliseconds of *consecutive* speech frames.
-Speaker bleed tends to arrive in short bursts, so a longer continuous run is
-much harder for it to clear, while sustained human speech still does.
-Raised `300 → 700`.
+While the speakers are audible, VAD demands more before it will call something
+an interruption:
 
-Cost: ~400 ms slower barge-in response.
+- `barge_in_energy_multiplier: 2.5` — energy must exceed `2.5 ×` the calibrated
+  threshold. The user's voice at the mic is far louder than a reply that has
+  crossed the room, so most bleed is rejected outright.
+- `barge_in_aggressiveness: 3` — the strictest WebRTC setting, used only during
+  playback.
+- `barge_in_debounce_ms: 240` — the speech must be *consecutive*. Bleed arrives
+  in bursts shaped by the reply's own syllables; a sustained run is much harder
+  for it to clear than a single loud frame.
+
+Bleed is voiced audio, so the VAD is right to call it speech. Demanding it be
+louder and sustained is the only acoustic lever available.
 
 ### (5) Echo guard — the text layer
 
 Layers 1–4 all trade responsiveness for safety and none of them can be made
 airtight. The echo guard is the only layer that actually *identifies* echo
-rather than reducing its odds, and it is the layer that stops the self-reply
-loop. Independent of `barge_in`; on by default via `reason.echo_guard`.
+rather than reducing its odds. It stops the self-reply loop, and with barge-in
+on it is also the verdict that decides whether an interrupt was the user or the
+assistant hearing itself. On by default via `echo.guard`.
 
 ---
 
@@ -129,41 +148,44 @@ is *currently* saying.
 
 ## 4. Where it is wired in
 
-**Write side — TTS worker** ([workers.py](../pipeline/realtime/workers.py),
-`tts_worker`): just before synthesis, `recent_speech.add(tr.text)`.
+**Write side — TTS stage** ([workers.py](../pipeline/realtime/workers.py),
+`TTSStage.run`): just before synthesis, `recent_speech.add(reply.text)`.
 
 Recorded at synthesis rather than at generation because text that never
-reaches synthesis never reaches the room. Aborted output would otherwise
-poison the window with words nobody heard.
+reaches synthesis never reaches the room. A reply that fails to synthesize
+would otherwise poison the window with words nobody heard.
 
-**Read side — STT worker** (`stt_worker`): after the noise/filler filter, if
-the transcript is an echo of the window snapshot, log it as
-`<echo of assistant output, dropped>` and `continue` — it never reaches
-`transcript_queue`, so the model never sees it.
+**Read side — STT stage** (`STTStage.run`): after the empty-transcript filter,
+if the transcript is an echo of the window snapshot, emit `echo_dropped` and
+`continue` — it never reaches `transcript_queue`, so the model never sees it.
 
-**Ownership** — `run_realtime.py` constructs one `RecentSpeech` (only in
-`reason` mode, only when `reason.echo_guard` is set) and hands the same
-instance to both workers, plus an `on_echo` callback.
+**Ownership** — `run_realtime.py` constructs one `RecentSpeech` (when
+`echo.guard` is set) and hands the same instance to both stages, plus an
+`on_echo` callback.
 
 ---
 
-## 5. What the echo guard cannot undo
+## 5. What the echo guard can and cannot undo
 
-Dropping the transcript stops the *self-reply*. It does **not** un-do a
-self-interrupt that already happened, because barge-in fires on VAD energy
-seconds before the transcript exists — and waiting for the transcript would
-mean seconds of the assistant talking over you. By the time echo is known:
+Dropping the transcript stops the *self-reply*, always.
 
-- the aborted audio cannot be resumed (tokens are discarded on abort), and
-- the memory wipe has already fired.
+Whether it can undo a *self-interrupt* depends on whether barge-in is on:
 
-So `on_echo` logs a loud warning instead:
+- **`barge_in.enabled: false`** — nothing to undo. The mic is muted during
+  playback, so no interrupt can fire in the first place.
+- **`barge_in.enabled: true`** — yes, and this is the point of the two-tier
+  design in [bargeIn.md](bargeIn.md). Stopping playback is made *provisional*
+  precisely so the echo guard's verdict, ~1–2 s later, can reverse it and play
+  the reply again. The cost of a false interrupt is a restarted sentence.
 
-> Echo detected — assistant heard its own output. If this repeats, lower the
-> output volume or set `reason.barge_in: false`.
+Either way `on_echo` logs a warning, because echo reaching the text layer at all
+means the acoustic layers (1–4) are mis-tuned for the room:
 
-That message means the acoustic layers (1–4) are mis-tuned for the room, and
-the text layer is covering for them.
+> Echo detected — the assistant heard its own output. If this repeats, lower
+> `tts.normalize.target_lufs` or raise `echo.mute_tail_ms`.
+
+Repeated `replay_exhausted` is the loud version of the same message: the room is
+echoing badly enough that the reply cannot get through its own bleed.
 
 ---
 
@@ -171,12 +193,15 @@ the text layer is covering for them.
 
 | Key | Value | Purpose |
 |---|---|---|
-| `reason.echo_guard` | `true` | Enable text-level echo detection |
-| `reason.echo_threshold` | `0.6` | Word-overlap fraction to call it echo. Lower = more aggressive (may swallow real speech that quotes the assistant); higher = more echo slips through |
-| `reason.barge_in_grace_ms` | `2000` | Ignore speech starts this long after output begins |
-| `reason.mute_capture_while_replying` | `true` | Drop mic frames while speaking (excludes barge-in) |
-| `capture.vad.speech_start_debounce_ms` | `700` | Consecutive speech required for barge-in |
+| `echo.guard` | `true` | Enable text-level echo detection. Required by `barge_in.enabled` |
+| `echo.threshold` | `0.6` | Word-overlap fraction to call it echo. Lower = more aggressive (may swallow real speech that quotes the assistant); higher = more echo slips through |
+| `echo.window` | `6` | Recent replies compared against |
+| `echo.mute_capture_while_replying` | `true` | Drop mic frames while speaking. Ignored when `barge_in.enabled` |
+| `echo.mute_tail_ms` | `400` | Hold the mic closed past the last sample, for speaker/room ring |
 | `tts.normalize.target_lufs` | `-23.0` | Output loudness; lower = less bleed |
+
+Barge-in's own keys (`barge_in.*`, `capture.vad.barge_in_*`) are documented in
+[bargeIn.md](bargeIn.md).
 
 ---
 
@@ -184,11 +209,12 @@ the text layer is covering for them.
 
 | Symptom | Fix |
 |---|---|
-| Assistant replies to itself | Confirm `reason.echo_guard: true`; lower `echo_threshold` toward `0.5` |
-| Assistant cuts itself off | Raise `barge_in_grace_ms`; raise `speech_start_debounce_ms`; lower `target_lufs` |
-| Real interruptions ignored | Raise `echo_threshold` toward `0.75`; lower `barge_in_grace_ms` |
-| Barge-in feels sluggish | Lower `speech_start_debounce_ms` (accepting more false interrupts) |
-| Nothing works on this desk | Use headphones, or `reason.barge_in: false` + `mute_capture_while_replying: true` — the only airtight combination |
+| Assistant replies to itself | Confirm `echo.guard: true`; lower `echo.threshold` toward `0.5` |
+| Assistant cuts itself off | Raise `capture.vad.barge_in_energy_multiplier` and `barge_in_debounce_ms`; lower `tts.normalize.target_lufs` |
+| Real interruptions ignored | Raise `echo.threshold` toward `0.75`; lower `barge_in_debounce_ms` |
+| Barge-in feels sluggish | Lower `barge_in_debounce_ms` / `barge_in_grace_ms` (accepting more false interrupts, which are now recoverable) |
+| Replies keep restarting | The room is echoing: lower `target_lufs`, raise `barge_in_energy_multiplier` |
+| Nothing works on this desk | Use headphones, or `barge_in.enabled: false` + `mute_capture_while_replying: true` — the only airtight combination |
 
 The genuinely airtight fix is physical: **headphones**, or a directional mic
 pointed away from the speakers. Every software layer above is mitigation.
@@ -204,3 +230,11 @@ pointed away from the speakers. Every software layer above is mitigation.
   — the worker path: TTS records into the window, STT drops an echoing
   transcript, real speech passes through while the assistant talks, and the
   guard is inert when disabled.
+- [test_barge_in.py](../pipeline/tests/test_barge_in.py) — the interrupt state
+  machine and its verdict paths, including echo reversing an interrupt.
+
+```
+venv\Scripts\python.exe pipeline\tests\test_echo_guard.py
+venv\Scripts\python.exe pipeline\tests\test_echo_guard_integration.py
+venv\Scripts\python.exe pipeline\tests\test_barge_in.py
+```

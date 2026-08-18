@@ -85,7 +85,9 @@ and the model answers itself. Three layers guard against that:
    Capture drops frames entirely while audio is playing, so bleed is never
    recorded. Airtight, at the cost of not being able to interrupt mid-reply.
    `echo.mute_tail_ms` keeps the mute a moment past the last sample, since
-   speakers and room reverb ring on.
+   speakers and room reverb ring on. Ignored when `barge_in.enabled` — an
+   interruptible mic cannot be a muted one; a stricter VAD gate
+   (`capture.vad.barge_in_*`) takes over as the acoustic defence.
 3. **Echo guard** — `echo.guard: true`. The only layer that *identifies* echo
    rather than reducing its odds: if a transcript's words overlap what the
    assistant just said, it is bleed, not a human, and it never reaches the
@@ -93,6 +95,26 @@ and the model answers itself. Three layers guard against that:
 
 The genuinely airtight fix is physical: **headphones**, or a directional mic
 pointed away from the speakers. Everything above is mitigation.
+
+See [docs/echoReduction.md](../docs/echoReduction.md) for the full layer-by-layer
+account.
+
+## Barge-in
+
+`barge_in.enabled: true` lets the user cut a reply short mid-playback. The
+difficulty is that stopping has to happen in ~250 ms, while telling the user's
+voice apart from the assistant's own needs the transcript, ~1–2 s later — so the
+decision is split and the fast half is made reversible:
+
+- **Tier 1** — sustained speech over a strict VAD gate stops playback
+  immediately. Fast, and cannot tell you from the speakers.
+- **Tier 2** — the echo guard rules on that utterance: real speech abandons the
+  reply and flushes the queues; the assistant's own bleed replays it from the
+  start.
+
+A false interrupt therefore costs a restarted sentence, not a swallowed reply,
+which is what makes the tier-1 gate safe to tune aggressively. Requires
+`echo.guard`. Full design in [docs/bargeIn.md](../docs/bargeIn.md).
 
 ## The system prompt
 

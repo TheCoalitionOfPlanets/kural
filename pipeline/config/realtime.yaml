@@ -20,12 +20,18 @@ capture:
     # -- barge-in gate: applies only while the speakers are audible ----------
     # Bleed is voiced audio, so the VAD is right to call it speech. The only
     # acoustic levers are demanding it be louder and demanding it be sustained.
-    # These are safe to tune aggressively: a false duck costs one replayed
-    # sentence, because the text guard reverses it.
+    # An interrupt is final — the reply is never resumed — so these are the
+    # defence against the assistant's own voice cutting it off. Raise them if
+    # replies stop on their own.
     barge_in_aggressiveness: 3      # webrtc only; strict VAD while audible
     barge_in_energy_multiplier: 2.5 # energy threshold x this while audible
     barge_in_debounce_ms: 240       # consecutive speech needed to interrupt
     barge_in_grace_ms: 350          # ignore speech this soon after audio begins
+    # Discard mic frames for this long after the speakers go silent. Stopping
+    # playback does not stop the room — speakers and reverb ring on, and that
+    # ring must not be recorded as the start of the user's turn. Skipped
+    # mid-utterance, where the audio is the user who caused the interrupt.
+    post_playback_deafen_ms: 250
 
 queues:
   audio_queue:       { maxsize: 8,  on_full: drop_oldest }
@@ -122,13 +128,16 @@ barge_in:
   #   tier 1  sustained speech over the strict VAD gate stops playback in
   #           ~240ms. Fast, and cannot tell the user from our own speakers.
   #   tier 2  STT + the echo guard rule on that utterance ~1-2s later:
-  #             real speech -> reply abandoned, reply/wav queues flushed
-  #             own echo    -> reply played again from the start
-  # Tier 1 being reversible is what makes its false positives cheap.
+  #             real speech -> utterance goes to the model, queues flushed
+  #             own echo    -> utterance discarded
+  #
+  # Stopping is FINAL: audio never resumes once interrupted. So the reply cannot
+  # be re-triggered by its own bleed, and the tier-1 gate above is what has to
+  # keep the assistant from cutting itself off.
   enabled: true
   # Longest wait for a tier-2 verdict. The utterance still has to close
   # (capture.vad.silence_ms) and be transcribed, so this must exceed
-  # silence_ms + worst-case STT latency. On expiry the reply resumes.
+  # silence_ms + worst-case STT latency. On expiry the utterance is discarded.
   verdict_timeout_ms: 6000
 
 echo:
@@ -142,6 +151,16 @@ echo:
   guard: true
   threshold: 0.6           # word-overlap fraction. Lower = more aggressive.
   window: 6                # recent replies compared against
+  # Entries older than this are dropped: a reply that finished playing long ago
+  # is not audible and cannot be bleeding, so keeping it only blocks later user
+  # speech that happens to reuse the same words. Must comfortably exceed the
+  # longest reply's playback time. 0 disables expiry.
+  ttl_s: 30
+  # A shared run of this many words in the same order counts as echo on its own,
+  # regardless of the overlap fraction. Word order is evidence that plain
+  # containment discards, and bleed arrives as a contiguous fragment of a reply.
+  # Lower = more aggressive; below ~4 real speech starts matching by chance.
+  ngram: 5
 
 playback:
   device: default

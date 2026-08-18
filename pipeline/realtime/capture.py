@@ -152,6 +152,11 @@ class CaptureThread(threading.Thread):
         # Ignore speech starts for this long after playback begins. The opening
         # of a reply is its loudest, most bleed-prone moment.
         self.barge_in_grace_s = float(v.get("barge_in_grace_ms", 350)) / 1000.0
+        # Frames are discarded for this long after the speakers go silent.
+        # Stopping the write loop does not stop the room: speakers and reverb
+        # ring on past the last sample, and that ringing is exactly what must
+        # not be recorded as the start of the user's turn.
+        self.deafen_s = float(v.get("post_playback_deafen_ms", 250)) / 1000.0
 
         self._frames = queue.Queue(maxsize=256)
         self._counter = itertools.count(1)
@@ -248,6 +253,9 @@ class CaptureThread(threading.Thread):
             barge_run = 0
             barged = False
             playback_since = None
+            # Deadline until which post-playback ring is discarded.
+            deafen_until = 0.0
+            was_audible = False
 
             while not self.stop_event.is_set():
                 frame = self._next_frame()
@@ -260,6 +268,8 @@ class CaptureThread(threading.Thread):
                 # Without an interrupt controller, fall back to the old layer-2
                 # behaviour: drop frames while the assistant is audible.
                 # Airtight against self-hearing, but nothing can interrupt.
+                # `mute_tail_ms` already covers the ring on this path, so the
+                # deafen window below is not applied here.
                 if assistant_audible and self.interrupt is None:
                     if not muted:
                         muted = True
@@ -276,6 +286,23 @@ class CaptureThread(threading.Thread):
                     muted = False
                     self.on_status("unmuted")
 
+                # The moment the speakers go silent, open a short deafen window:
+                # playback stopping does not stop the room, and that ring must
+                # not be recorded as the start of a turn.
+                if self.interrupt is not None:
+                    if was_audible and not assistant_audible:
+                        deafen_until = time.monotonic() + self.deafen_s
+                    was_audible = assistant_audible
+
+                    # Never while an utterance is already being recorded:
+                    # mid-utterance that audio is the user talking (they are why
+                    # playback stopped), and cutting it here would clip the very
+                    # turn this mechanism exists to capture.
+                    if (not assistant_audible and not speaking
+                            and time.monotonic() < deafen_until):
+                        preroll.clear()
+                        continue
+
                 # The mic stays live during playback, so the utterance that
                 # interrupts is recorded from its first phoneme. The stricter
                 # gate applies only while the speakers are actually audible.
@@ -291,7 +318,13 @@ class CaptureThread(threading.Thread):
                 # Tier 1: sustained speech over the strict gate stops playback.
                 # Provisional — the STT stage reverses it if the transcript
                 # turns out to be our own reply coming back.
-                if assistant_audible and is_speech and not barged:
+                if not (assistant_audible and is_speech):
+                    # The run must be *consecutive*; bleed rarely sustains. Reset
+                    # on silence AND whenever the speakers go quiet, so a run
+                    # built up against one reply cannot carry over and interrupt
+                    # the next one on its first frame.
+                    barge_run = 0
+                elif not barged:
                     in_grace = (time.monotonic() - playback_since
                                 < self.barge_in_grace_s)
                     barge_run += 1
@@ -299,9 +332,6 @@ class CaptureThread(threading.Thread):
                         if self.interrupt.claim():
                             barged = True
                             self.on_status("barge_in")
-                elif assistant_audible and not is_speech:
-                    # The run must be *consecutive*; bleed rarely sustains.
-                    barge_run = 0
 
                 if not speaking:
                     preroll.append(frame)

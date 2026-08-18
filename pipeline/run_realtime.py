@@ -121,7 +121,7 @@ def main():
         elif kind == "unmuted":
             console.line("  (mic live)")
         elif kind == "barge_in":
-            console.line("  speech over playback — stopping to check...")
+            console.line("  interrupted — stopping playback")
         elif kind == "dropped":
             console.line(f"  ! dropped {kw['utt_id']} — pipeline saturated")
         elif kind == "frame_drops":
@@ -151,23 +151,20 @@ def main():
         elif kind == "echo_dropped":
             console.line(f"[{utt}] echo of own output, dropped: {kw['text']}")
         elif kind == "barge_in_confirmed":
-            console.line(f"[{utt}] real speech — reply abandoned")
+            console.line(f"[{utt}] interrupted by you — reply dropped")
         elif kind == "barge_in_rejected":
-            console.line(f"[{utt}] was our own output ({kw.get('reason')}) — "
-                         f"resuming reply")
+            # The reply was cut off by its own bleed. It does not come back, so
+            # this is a mis-tuning warning, not just an FYI.
+            console.line(
+                f"[{utt}] ! reply was cut off by its own echo ({kw.get('reason')}). "
+                f"Lower tts.normalize.target_lufs, or raise "
+                f"capture.vad.barge_in_energy_multiplier / barge_in_debounce_ms."
+            )
         elif kind == "barge_in_abandoned":
-            console.line(f"  no verdict ({kw.get('reason')}) — resuming reply")
-        elif kind == "playback_replay":
-            console.line(f"[{utt}] replaying reply (attempt {kw.get('attempt')})")
+            console.line(f"  interrupt had no transcript ({kw.get('reason')}) — "
+                         f"nothing sent to the model")
         elif kind == "playback_aborted":
             console.line(f"[{utt}] playback stopped")
-        elif kind == "replay_exhausted":
-            console.line(
-                f"[{utt}] ! gave up replaying after {kw.get('attempts')} tries — "
-                f"the room is echoing badly. Lower tts.normalize.target_lufs, or "
-                f"raise capture.vad.barge_in_debounce_ms / "
-                f"barge_in_energy_multiplier."
-            )
         elif kind == "barge_in_provisional":
             pass  # already reported by the capture-side "barge_in" event
         elif kind == "tts_no_voice":
@@ -193,21 +190,25 @@ def main():
     # Echo reduction and barge-in are the same problem seen from two sides, so
     # they share state. `speaking_event` marks the assistant as audible; with
     # barge-in off that means "drop mic frames" (airtight, uninterruptible), and
-    # with it on it means "apply the strict VAD gate" (interruptible, and the
-    # text guard reverses the false ducks).
+    # with it on it means "apply the strict VAD gate" (interruptible, with the
+    # text guard keeping bleed from reaching the model as a user turn).
     echo_cfg = cfg.get("echo", {})
     barge_cfg = cfg.get("barge_in", {})
     barge_in_enabled = bool(barge_cfg.get("enabled", False))
 
-    recent_speech = RecentSpeech(echo_cfg.get("window", 6)) if echo_cfg.get(
-        "guard", True) else None
+    recent_speech = RecentSpeech(
+        echo_cfg.get("window", 6),
+        ttl_s=float(echo_cfg.get("ttl_s", 30)),
+        ngram=int(echo_cfg.get("ngram", 5)),
+    ) if echo_cfg.get("guard", True) else None
     echo_threshold = float(echo_cfg.get("threshold", 0.6))
     mute_tail_s = float(echo_cfg.get("mute_tail_ms", 0)) / 1000.0
 
     if barge_in_enabled and recent_speech is None:
-        # Tier 1 ducks on acoustics alone; the text guard is the only thing that
-        # can tell it that the duck was our own reply. Without it every bleed
-        # burst aborts the reply and flushes the pipeline.
+        # Tier 1 stops playback on acoustics alone; the text guard is the only
+        # thing that can tell whether it was the user. Without it every bleed
+        # burst that survives the strict gate reaches the model as a user turn
+        # and flushes the pipeline — the self-reply loop, with extra steps.
         print("barge_in.enabled requires echo.guard — enable echo.guard or "
               "disable barge_in.", file=sys.stderr)
         raise SystemExit(1)
@@ -331,12 +332,13 @@ def main():
         STTStage(stt_worker, spill_dir, audio_q, transcript_q, stop_event, on_stage,
                  recent_speech=recent_speech, echo_threshold=echo_threshold,
                  on_echo=on_echo, interrupt=interrupt, on_flush=flush_downstream),
-        LLMStage(llm_worker, transcript_q, reply_q, stop_event, on_stage),
+        LLMStage(llm_worker, transcript_q, reply_q, stop_event, on_stage,
+                 recent_speech=recent_speech),
         TTSStage(tts_worker, spill_dir, reply_q, wav_q, stop_event, on_stage,
                  recent_speech=recent_speech),
         PlaybackStage(player, keep_wavs, wav_q, None, stop_event, on_stage,
                       speaking_event=speaking_event, mute_tail_s=mute_tail_s,
-                      interrupt=interrupt,
+                      interrupt=interrupt, recent_speech=recent_speech,
                       verdict_timeout_s=float(
                           barge_cfg.get("verdict_timeout_ms", 6000)) / 1000.0),
     ]

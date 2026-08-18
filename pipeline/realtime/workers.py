@@ -46,11 +46,14 @@ class _Stage(threading.Thread):
 class STTStage(_Stage):
     """audio_queue -> transcript_queue
 
-    Also tier 2 of barge-in. When an utterance provisionally interrupted
-    playback, this stage owns the verdict: the transcript is the first point in
-    the pipeline where the user and the assistant's own voice are separable at
-    all. Every exit path below must resolve the claim — an unresolved one leaves
-    the interrupted reply silent forever.
+    Also tier 2 of barge-in. When an utterance interrupted playback, this stage
+    owns the verdict: the transcript is the first point in the pipeline where the
+    user and the assistant's own voice are separable at all.
+
+    The verdict does not restore the audio — an interrupt is final. It decides
+    whether the utterance reaches the model (real turn) or is discarded (our own
+    bleed). Every exit path below must still resolve the claim, or playback sits
+    waiting on a verdict that never comes.
     """
 
     def __init__(self, worker, spill_dir, *args, recent_speech=None,
@@ -110,9 +113,8 @@ class STTStage(_Stage):
             text = (res.get("text") or "").strip()
             if not text:
                 # Non-speech. Dropping here keeps the LLM from being asked to
-                # reason about silence. As an interrupt verdict it is inconclusive
-                # rather than negative — no words means no evidence either way —
-                # so the reply resumes.
+                # reason about silence, and as an interrupt verdict it releases
+                # playback from waiting.
                 self.on_event("stt_empty", utt_id=utt.utt_id)
                 self._resolve(utt, "abandon", "stt_empty")
                 continue
@@ -126,9 +128,9 @@ class STTStage(_Stage):
                 self.on_event("echo_dropped", utt_id=utt.utt_id, text=text,
                               barge_in=getattr(utt, "barge_in", False))
                 self.on_echo(utt.utt_id, text)
-                # This is the case the two-tier split exists for: the duck was
-                # our own reply bleeding back, so it is reversed and the reply
-                # is played again from the start.
+                # The interrupt was our own reply bleeding back. The audio is
+                # already gone for good; this just stops the bleed from being
+                # treated as a user turn.
                 self._resolve(utt, "reject", "echo")
                 continue
 
@@ -147,9 +149,14 @@ class STTStage(_Stage):
 class LLMStage(_Stage):
     """transcript_queue -> reply_queue"""
 
-    def __init__(self, worker, *args):
+    def __init__(self, worker, *args, recent_speech=None):
         super().__init__("llm", *args)
         self.worker = worker
+        # Cached here, the moment the text exists, rather than only at synthesis.
+        # TTS can lag far enough behind that bleed from a fast reply reaches the
+        # STT check before TTSStage has recorded it, and an unrecorded reply is
+        # invisible to the guard — exactly the hole the loop escapes through.
+        self.recent_speech = recent_speech
 
     def run(self):
         while not self.stop_event.is_set():
@@ -171,6 +178,9 @@ class LLMStage(_Stage):
             if not text:
                 self.on_event("llm_empty", utt_id=sent.utt_id)
                 continue
+
+            if self.recent_speech is not None:
+                self.recent_speech.add(text)
 
             self.on_event("llm", utt_id=sent.utt_id, text=text,
                           lang=res.get("lang"), elapsed_s=res.get("elapsed_s"))
@@ -240,22 +250,24 @@ class TTSStage(_Stage):
 class PlaybackStage(_Stage):
     """wav_queue -> speaker (terminal stage)
 
-    Acts on both barge-in tiers. Tier 1 breaks the write loop out of the file;
-    tier 2 then decides whether the file is dropped (real user) or played again
-    from the start (own echo).
+    An interrupt is final: tier 1 breaks the write loop out of the file and the
+    reply is abandoned there. It is never replayed, so the assistant's own voice
+    cannot re-trigger it and no reply can loop on its own bleed.
+
+    Tier 2's verdict still runs, but it rules on the *user's utterance* — real
+    speech goes to the model, echo is discarded — not on the audio.
     """
 
-    # A reply is replayed at most this many times. Without a cap, a room where
-    # every reply reliably triggers a false duck would replay the same sentence
-    # forever, each attempt bleeding again — the runaway loop, in a new shape.
-    MAX_REPLAYS = 2
-
     def __init__(self, player, keep_wavs, *args, speaking_event=None,
-                 mute_tail_s=0.0, interrupt=None, verdict_timeout_s=6.0):
+                 mute_tail_s=0.0, interrupt=None, verdict_timeout_s=6.0,
+                 recent_speech=None):
         super().__init__("playback", *args)
         self.player = player
         self.keep_wavs = keep_wavs
         self.speaking_event = speaking_event
+        # Restamped here so the echo cache's TTL runs from when the room could
+        # actually hear the reply, not from when synthesis began.
+        self.recent_speech = recent_speech
         # Speakers and room reverb keep ringing briefly after the file ends;
         # unmuting exactly at the last sample lets the tail back in.
         self.mute_tail_s = float(mute_tail_s)
@@ -270,19 +282,27 @@ class PlaybackStage(_Stage):
             or self.stop_event.is_set()
 
     def _await_verdict(self, utt_id):
-        """Block until tier 2 rules on the interrupt. Returns "replay" or "abort"."""
+        """Block until tier 2 rules on the interrupt.
+
+        The verdict no longer decides whether the *audio* comes back — once
+        stopped it stays stopped. It decides only what happens to the user's
+        utterance: a real turn goes on to the model, an echo is discarded. So
+        the return value is informational and playback ends either way.
+        """
         deadline = time.monotonic() + self.verdict_timeout_s
         while not self.stop_event.is_set():
             if not self.interrupt.pending.is_set():
-                return "replay" if self.interrupt.replay.is_set() else "abort"
+                return "echo" if self.interrupt.rejected.is_set() else "user"
             if time.monotonic() >= deadline:
                 self.interrupt.abandon("verdict_timeout")
-                return "replay"
+                return "unknown"
             time.sleep(0.02)
-        return "abort"
+        return "unknown"
 
     def _play_once(self, job):
         """One pass over the file. Returns True when it played to the end."""
+        if self.recent_speech is not None:
+            self.recent_speech.touch(job.text)
         if self.speaking_event is not None:
             self.speaking_event.set()
         if self.interrupt is not None:
@@ -297,9 +317,14 @@ class PlaybackStage(_Stage):
             if self.interrupt is not None:
                 self.interrupt.end_playback()
             if self.speaking_event is not None:
-                # Only pay the reverb tail when the reply actually finished. On
-                # an interrupt the room is already going quiet and the user is
-                # mid-sentence, so holding the strict gate there would clip them.
+                # Cleared as soon as the audio stops, interrupt or not: it means
+                # "the speakers are live", and during the verdict wait they are
+                # not. Leaving it set would hold the strict barge-in gate over a
+                # silent room and clip the user mid-sentence.
+                #
+                # The reverb tail is only paid on a natural finish. After an
+                # interrupt the user is already talking, so sleeping here would
+                # eat the start of their turn.
                 if self.mute_tail_s and not self.interrupt_pending():
                     time.sleep(self.mute_tail_s)
                 self.speaking_event.clear()
@@ -323,27 +348,20 @@ class PlaybackStage(_Stage):
                 total_ms=int((t_first_audio - job.t_captured) * 1000),
             )
 
-            attempts = 0
-            while not self.stop_event.is_set():
-                completed = self._play_once(job)
-                if completed or self.interrupt is None:
-                    break
+            completed = self._play_once(job)
 
-                # Interrupted. Wait for the transcript before deciding whether
-                # this reply is finished or merely paused.
+            if not completed and self.interrupt is not None:
+                # Interrupted: the audio is already silent and stays that way.
+                # The verdict still matters, but only for the user's utterance —
+                # a real turn proceeds to the model, an echo is discarded — so
+                # it is awaited rather than acted on here.
                 verdict = self._await_verdict(job.utt_id)
-                if verdict == "abort":
-                    self.on_event("playback_aborted", utt_id=job.utt_id)
-                    break
+                self.on_event("playback_aborted", utt_id=job.utt_id,
+                              verdict=verdict)
 
-                attempts += 1
-                if attempts > self.MAX_REPLAYS:
-                    self.on_event("replay_exhausted", utt_id=job.utt_id,
-                                  attempts=attempts)
-                    break
-                self.on_event("playback_replay", utt_id=job.utt_id,
-                              attempt=attempts)
-
+            # The reply is finished with, however it ended. `clear()` also
+            # releases `playing`, which end_playback() deliberately holds while
+            # a verdict is outstanding.
             if self.interrupt is not None:
                 self.interrupt.clear()
             if not self.keep_wavs:
