@@ -24,6 +24,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from pipeline.realtime.audio_out import Player
 from pipeline.realtime.capture import CaptureThread
 from pipeline.realtime.echo_guard import RecentSpeech
+from pipeline.realtime.interrupt import InterruptController
 from pipeline.realtime.proc import WorkerProcess
 from pipeline.realtime.workers import LLMStage, PlaybackStage, STTStage, TTSStage
 
@@ -119,6 +120,8 @@ def main():
             console.line("  (mic muted while replying)")
         elif kind == "unmuted":
             console.line("  (mic live)")
+        elif kind == "barge_in":
+            console.line("  speech over playback — stopping to check...")
         elif kind == "dropped":
             console.line(f"  ! dropped {kw['utt_id']} — pipeline saturated")
         elif kind == "frame_drops":
@@ -147,6 +150,26 @@ def main():
             console.line(f"[{utt}] no speech recognized")
         elif kind == "echo_dropped":
             console.line(f"[{utt}] echo of own output, dropped: {kw['text']}")
+        elif kind == "barge_in_confirmed":
+            console.line(f"[{utt}] real speech — reply abandoned")
+        elif kind == "barge_in_rejected":
+            console.line(f"[{utt}] was our own output ({kw.get('reason')}) — "
+                         f"resuming reply")
+        elif kind == "barge_in_abandoned":
+            console.line(f"  no verdict ({kw.get('reason')}) — resuming reply")
+        elif kind == "playback_replay":
+            console.line(f"[{utt}] replaying reply (attempt {kw.get('attempt')})")
+        elif kind == "playback_aborted":
+            console.line(f"[{utt}] playback stopped")
+        elif kind == "replay_exhausted":
+            console.line(
+                f"[{utt}] ! gave up replaying after {kw.get('attempts')} tries — "
+                f"the room is echoing badly. Lower tts.normalize.target_lufs, or "
+                f"raise capture.vad.barge_in_debounce_ms / "
+                f"barge_in_energy_multiplier."
+            )
+        elif kind == "barge_in_provisional":
+            pass  # already reported by the capture-side "barge_in" event
         elif kind == "tts_no_voice":
             # Piper has no voice for this language, so the reply is text-only.
             # Print it rather than dropping it silently — the answer is still
@@ -167,19 +190,39 @@ def main():
     reply_q = queue.Queue(maxsize=q.get("reply_queue", {}).get("maxsize", 32))
     wav_q = queue.Queue(maxsize=q.get("wav_queue", {}).get("maxsize", 8))
 
-    # Echo reduction. Layer 2 (muting) is airtight but blunt; layer 5 (the
-    # guard) catches whatever survives it — a reply still ringing in the room
-    # at the moment capture unmutes.
+    # Echo reduction and barge-in are the same problem seen from two sides, so
+    # they share state. `speaking_event` marks the assistant as audible; with
+    # barge-in off that means "drop mic frames" (airtight, uninterruptible), and
+    # with it on it means "apply the strict VAD gate" (interruptible, and the
+    # text guard reverses the false ducks).
     echo_cfg = cfg.get("echo", {})
-    speaking_event = threading.Event() if echo_cfg.get(
-        "mute_capture_while_replying", True) else None
+    barge_cfg = cfg.get("barge_in", {})
+    barge_in_enabled = bool(barge_cfg.get("enabled", False))
+
     recent_speech = RecentSpeech(echo_cfg.get("window", 6)) if echo_cfg.get(
         "guard", True) else None
     echo_threshold = float(echo_cfg.get("threshold", 0.6))
     mute_tail_s = float(echo_cfg.get("mute_tail_ms", 0)) / 1000.0
 
+    if barge_in_enabled and recent_speech is None:
+        # Tier 1 ducks on acoustics alone; the text guard is the only thing that
+        # can tell it that the duck was our own reply. Without it every bleed
+        # burst aborts the reply and flushes the pipeline.
+        print("barge_in.enabled requires echo.guard — enable echo.guard or "
+              "disable barge_in.", file=sys.stderr)
+        raise SystemExit(1)
+
+    # The mic must stay live during playback for anything to be interruptible,
+    # so barge-in implies the speaking flag is a gate selector, not a mute.
+    speaking_event = threading.Event() if (
+        barge_in_enabled or echo_cfg.get("mute_capture_while_replying", True)
+    ) else None
+
+    interrupt = InterruptController(on_event=lambda k, **kw: on_stage(k, **kw)) \
+        if barge_in_enabled else None
+
     capture = CaptureThread(cfg["capture"], audio_q, stop_event, on_capture,
-                            speaking_event=speaking_event)
+                            speaking_event=speaking_event, interrupt=interrupt)
 
     # -- capture-only mode (build order step 1) ----------------------------
 
@@ -260,15 +303,42 @@ def main():
             f"echo.mute_tail_ms."
         )
 
+    def flush_downstream(utt_id):
+        """Drop replies for turns the user has interrupted past.
+
+        Called only on a *confirmed* barge-in. Anything already in the reply or
+        wav queues answers a question the user has moved on from; playing it
+        after they have started a new turn is worse than dropping it.
+
+        transcript_queue is deliberately left alone: an item there is a user
+        turn that has not been answered yet, not a stale reply.
+        """
+        dropped = 0
+        for q_ in (reply_q, wav_q):
+            while True:
+                try:
+                    item = q_.get_nowait()
+                except queue.Empty:
+                    break
+                dropped += 1
+                path = getattr(item, "wav_path", None)
+                if path is not None and not keep_wavs:
+                    path.unlink(missing_ok=True)
+        if dropped:
+            console.line(f"  flushed {dropped} stale repl{'y' if dropped == 1 else 'ies'}")
+
     stages = [
         STTStage(stt_worker, spill_dir, audio_q, transcript_q, stop_event, on_stage,
                  recent_speech=recent_speech, echo_threshold=echo_threshold,
-                 on_echo=on_echo),
+                 on_echo=on_echo, interrupt=interrupt, on_flush=flush_downstream),
         LLMStage(llm_worker, transcript_q, reply_q, stop_event, on_stage),
         TTSStage(tts_worker, spill_dir, reply_q, wav_q, stop_event, on_stage,
                  recent_speech=recent_speech),
         PlaybackStage(player, keep_wavs, wav_q, None, stop_event, on_stage,
-                      speaking_event=speaking_event, mute_tail_s=mute_tail_s),
+                      speaking_event=speaking_event, mute_tail_s=mute_tail_s,
+                      interrupt=interrupt,
+                      verdict_timeout_s=float(
+                          barge_cfg.get("verdict_timeout_ms", 6000)) / 1000.0),
     ]
 
     for s in stages:

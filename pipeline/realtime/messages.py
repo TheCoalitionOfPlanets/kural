@@ -18,6 +18,10 @@ class Utterance:
     sample_rate: int
     duration_s: float
     t_captured: float      # perf_counter at VAD close
+    # True when this utterance provisionally interrupted playback. The STT stage
+    # owes a verdict on it: real speech confirms the interrupt, an echo reverses
+    # it. See interrupt.py.
+    barge_in: bool = False
 
 
 @dataclass
@@ -27,6 +31,7 @@ class Sentence:
     text: str
     t_captured: float
     t_stt_done: float = 0.0
+    barge_in: bool = False
 
 
 @dataclass

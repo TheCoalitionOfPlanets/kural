@@ -17,6 +17,15 @@ capture:
     min_utterance_ms: 300
     max_utterance_ms: 15000
     pre_roll_ms: 300
+    # -- barge-in gate: applies only while the speakers are audible ----------
+    # Bleed is voiced audio, so the VAD is right to call it speech. The only
+    # acoustic levers are demanding it be louder and demanding it be sustained.
+    # These are safe to tune aggressively: a false duck costs one replayed
+    # sentence, because the text guard reverses it.
+    barge_in_aggressiveness: 3      # webrtc only; strict VAD while audible
+    barge_in_energy_multiplier: 2.5 # energy threshold x this while audible
+    barge_in_debounce_ms: 240       # consecutive speech needed to interrupt
+    barge_in_grace_ms: 350          # ignore speech this soon after audio begins
 
 queues:
   audio_queue:       { maxsize: 8,  on_full: drop_oldest }
@@ -104,9 +113,28 @@ tts:
     target_lufs: -23.0     # null to disable; -16 is typical streaming loudness
     peak: 0.7              # hard ceiling after loudness normalization
 
+barge_in:
+  # Let the user interrupt a reply in progress. Requires echo.guard: the mic
+  # stays live during playback, so the text guard is the only thing standing
+  # between speaker bleed and a self-interrupt.
+  #
+  # Two tiers, because the two halves of the decision have different deadlines:
+  #   tier 1  sustained speech over the strict VAD gate stops playback in
+  #           ~240ms. Fast, and cannot tell the user from our own speakers.
+  #   tier 2  STT + the echo guard rule on that utterance ~1-2s later:
+  #             real speech -> reply abandoned, reply/wav queues flushed
+  #             own echo    -> reply played again from the start
+  # Tier 1 being reversible is what makes its false positives cheap.
+  enabled: true
+  # Longest wait for a tier-2 verdict. The utterance still has to close
+  # (capture.vad.silence_ms) and be transcribed, so this must exceed
+  # silence_ms + worst-case STT latency. On expiry the reply resumes.
+  verdict_timeout_ms: 6000
+
 echo:
   # Layer 2: drop mic frames entirely while the assistant is audible. Airtight
   # against self-hearing; the cost is that you cannot interrupt mid-reply.
+  # Ignored when barge_in.enabled — an interruptible mic cannot be a muted one.
   mute_capture_while_replying: true
   mute_tail_ms: 400        # speakers and room reverb ring on past the last sample
   # Layer 5: the only layer that identifies echo rather than reducing its odds.

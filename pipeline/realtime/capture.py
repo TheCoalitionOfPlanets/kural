@@ -28,6 +28,9 @@ class _EnergyVAD:
         self.margin = float(cfg.get("noise_margin", 3.0))
         self.min_threshold = float(cfg.get("min_threshold", 0.003))
         self.threshold = self.min_threshold
+        # See _WebRtcVAD: a stricter bar while the speakers are active, so most
+        # bleed is rejected before it can claim an interrupt.
+        self.barge_in_gate = float(cfg.get("barge_in_energy_multiplier", 2.5))
 
     def calibrate(self, frames):
         levels = [self._rms(f) for f in frames]
@@ -39,8 +42,9 @@ class _EnergyVAD:
     def _rms(frame):
         return float(np.sqrt(np.mean(np.square(frame))) + 1e-12)
 
-    def is_speech(self, frame):
-        return self._rms(frame) > self.threshold
+    def is_speech(self, frame, strict=False):
+        floor = self.threshold * (self.barge_in_gate if strict else 1.0)
+        return self._rms(frame) > floor
 
     def level(self, frame):
         return self._rms(frame)
@@ -54,6 +58,12 @@ class _WebRtcVAD:
     energy above the calibrated floor rejects that without dulling real speech.
 
     Requires 10/20/30ms frames at 8/16/32/48kHz.
+
+    Two aggressiveness settings are kept: the normal one, and a stricter one used
+    only while the speakers are active. Bleed is voiced audio — the VAD is right
+    to call it speech — so the only acoustic lever during playback is demanding
+    more of it. `barge_in_aggressiveness` and the louder gate below are the
+    acoustic half of the interrupt decision; the text guard is the other half.
     """
 
     def __init__(self, cfg, sample_rate, frame_ms):
@@ -62,17 +72,28 @@ class _WebRtcVAD:
         if frame_ms not in (10, 20, 30):
             raise ValueError(f"webrtc VAD needs frame_ms in 10/20/30, got {frame_ms}")
         self.vad = webrtcvad.Vad(int(cfg.get("aggressiveness", 2)))
+        strict = int(cfg.get("barge_in_aggressiveness",
+                             min(3, int(cfg.get("aggressiveness", 2)) + 1)))
+        self._strict_vad = webrtcvad.Vad(strict) if strict != int(
+            cfg.get("aggressiveness", 2)) else self.vad
         self.sample_rate = sample_rate
         self.gate = _EnergyVAD(cfg)
+        # Multiplier on the energy threshold while the assistant is audible.
+        # The user's own voice at the mic is far louder than a reply that has
+        # crossed the room, so raising the bar rejects most bleed outright.
+        self.barge_in_gate = float(cfg.get("barge_in_energy_multiplier", 2.5))
 
     def calibrate(self, frames):
         return self.gate.calibrate(frames)
 
-    def is_speech(self, frame):
-        if not self.gate.is_speech(frame):
+    def is_speech(self, frame, strict=False):
+        level = self.gate.level(frame)
+        floor = self.gate.threshold * (self.barge_in_gate if strict else 1.0)
+        if level <= floor:
             return False
         pcm16 = (np.clip(frame, -1.0, 1.0) * 32767).astype("<i2").tobytes()
-        return self.vad.is_speech(pcm16, self.sample_rate)
+        vad = self._strict_vad if strict else self.vad
+        return vad.is_speech(pcm16, self.sample_rate)
 
     def level(self, frame):
         return self.gate.level(frame)
@@ -97,15 +118,19 @@ class CaptureThread(threading.Thread):
     """
 
     def __init__(self, cfg, audio_queue, stop_event, on_status=None,
-                 speaking_event=None):
+                 speaking_event=None, interrupt=None):
         super().__init__(name="capture", daemon=True)
         self.cfg = cfg
         self.audio_queue = audio_queue
         self.stop_event = stop_event
         self.on_status = on_status or (lambda *a, **k: None)
-        # When set, the assistant is talking through the speakers. Frames are
-        # discarded rather than fed to the VAD so bleed is never recorded.
+        # When set, the assistant is talking through the speakers. With
+        # `interrupt` present the mic stays live and this only selects the
+        # stricter VAD gate; without it, frames are discarded outright (the old
+        # airtight-but-uninterruptible behaviour).
         self.speaking_event = speaking_event
+        # Barge-in arbitration. None disables interruption entirely.
+        self.interrupt = interrupt
 
         self.sample_rate = int(cfg["sample_rate"])
         self.frame_ms = int(cfg["frame_ms"])
@@ -118,6 +143,15 @@ class CaptureThread(threading.Thread):
         self.min_frames = int(v["min_utterance_ms"]) // self.frame_ms
         self.max_frames = int(v["max_utterance_ms"]) // self.frame_ms
         self.preroll_frames = int(v["pre_roll_ms"]) // self.frame_ms
+        # Consecutive speech frames required to claim an interrupt. Bleed
+        # arrives in bursts shaped by the reply's own syllables, so a sustained
+        # run is much harder for it to clear than a single loud frame; real
+        # speech clears it easily. This is the main barge-in tuning lever.
+        self.barge_in_frames = max(
+            1, int(v.get("barge_in_debounce_ms", 240)) // self.frame_ms)
+        # Ignore speech starts for this long after playback begins. The opening
+        # of a reply is its loudest, most bleed-prone moment.
+        self.barge_in_grace_s = float(v.get("barge_in_grace_ms", 350)) / 1000.0
 
         self._frames = queue.Queue(maxsize=256)
         self._counter = itertools.count(1)
@@ -166,7 +200,7 @@ class CaptureThread(threading.Thread):
         floor, threshold = self.vad.calibrate(frames)
         self.on_status("calibrated", floor=floor, threshold=threshold)
 
-    def _emit(self, frames, t_captured):
+    def _emit(self, frames, t_captured, barged=False):
         pcm = np.concatenate(frames)
         duration = len(pcm) / self.sample_rate
         utt = Utterance(
@@ -175,7 +209,13 @@ class CaptureThread(threading.Thread):
             sample_rate=self.sample_rate,
             duration_s=duration,
             t_captured=t_captured,
+            barge_in=barged,
         )
+        # An utterance that claimed an interrupt must be the one tier 2 judges,
+        # so the claim is bound to its id before it is queued — otherwise the
+        # STT stage cannot tell it apart from an unrelated utterance.
+        if barged and self.interrupt is not None:
+            self.interrupt.note_capture(utt.utt_id)
         # Q0 policy: drop oldest rather than block the capture path.
         try:
             self.audio_queue.put_nowait(utt)
@@ -183,6 +223,10 @@ class CaptureThread(threading.Thread):
             try:
                 stale = self.audio_queue.get_nowait()
                 self.on_status("dropped", utt_id=stale.utt_id)
+                if stale.barge_in and self.interrupt is not None:
+                    # The utterance holding the interrupt just fell off the
+                    # queue, so no verdict is ever coming for it.
+                    self.interrupt.abandon("utterance_dropped")
                 self.audio_queue.put_nowait(utt)
             except queue.Empty:
                 pass
@@ -199,16 +243,24 @@ class CaptureThread(threading.Thread):
             silence_run = 0
 
             muted = False
+            # Consecutive strict-gate speech frames seen during playback, and
+            # whether the utterance being recorded is the one that interrupted.
+            barge_run = 0
+            barged = False
+            playback_since = None
 
             while not self.stop_event.is_set():
                 frame = self._next_frame()
                 if frame is None:
                     continue
 
-                # Layer 2: drop frames entirely while the assistant is audible.
-                # Airtight against self-hearing, at the cost of not being able
-                # to interrupt mid-reply.
-                if self.speaking_event is not None and self.speaking_event.is_set():
+                assistant_audible = (self.speaking_event is not None
+                                     and self.speaking_event.is_set())
+
+                # Without an interrupt controller, fall back to the old layer-2
+                # behaviour: drop frames while the assistant is audible.
+                # Airtight against self-hearing, but nothing can interrupt.
+                if assistant_audible and self.interrupt is None:
                     if not muted:
                         muted = True
                         self.on_status("muted")
@@ -224,7 +276,32 @@ class CaptureThread(threading.Thread):
                     muted = False
                     self.on_status("unmuted")
 
-                is_speech = self.vad.is_speech(frame)
+                # The mic stays live during playback, so the utterance that
+                # interrupts is recorded from its first phoneme. The stricter
+                # gate applies only while the speakers are actually audible.
+                if assistant_audible:
+                    if playback_since is None:
+                        playback_since = time.monotonic()
+                else:
+                    playback_since = None
+                    barge_run = 0
+
+                is_speech = self.vad.is_speech(frame, strict=assistant_audible)
+
+                # Tier 1: sustained speech over the strict gate stops playback.
+                # Provisional — the STT stage reverses it if the transcript
+                # turns out to be our own reply coming back.
+                if assistant_audible and is_speech and not barged:
+                    in_grace = (time.monotonic() - playback_since
+                                < self.barge_in_grace_s)
+                    barge_run += 1
+                    if not in_grace and barge_run >= self.barge_in_frames:
+                        if self.interrupt.claim():
+                            barged = True
+                            self.on_status("barge_in")
+                elif assistant_audible and not is_speech:
+                    # The run must be *consecutive*; bleed rarely sustains.
+                    barge_run = 0
 
                 if not speaking:
                     preroll.append(frame)
@@ -251,13 +328,21 @@ class CaptureThread(threading.Thread):
                     frames, utterance = utterance, []
                     preroll.clear()
                     if len(frames) >= self.min_frames:
-                        utt = self._emit(frames, time.perf_counter())
+                        utt = self._emit(frames, time.perf_counter(), barged=barged)
                         self.on_status(
                             "utterance", utt_id=utt.utt_id,
                             duration=utt.duration_s, forced=forced,
+                            barge_in=barged,
                         )
                     else:
                         self.on_status("too_short")
+                        if barged and self.interrupt is not None:
+                            # Too short to transcribe, so tier 2 will never
+                            # rule on it. Treat the duck as a false positive
+                            # and let the reply resume.
+                            self.interrupt.abandon("too_short")
+                    barged = False
+                    barge_run = 0
                     silence_run = 0
 
         if self._dropped_frames:
