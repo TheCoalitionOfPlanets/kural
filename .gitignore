@@ -1,0 +1,72 @@
+# Virtual environments (top-level and per-component: reasoning/, tts/, ...)
+venv/
+env/
+.venv/
+**/venv/
+**/env/
+**/.venv/
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+pip-wheel-metadata/
+
+# Caches
+.cache/
+**/.cache/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Model weights / large binaries
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.gguf
+*.onnx
+*.tflite
+*.model
+# TorchScript archives (e.g. stt/models/model-asr.fp16.ts).
+# Scoped to models/ so any future TypeScript sources are not swallowed.
+**/models/**/*.ts
+tts/models/
+stt/models/
+reasoning/models/
+
+# Generated audio. Keep reference voices (tts/refs/) — they define the voice.
+*.wav
+*.mp3
+*.flac
+*.ogg
+!tts/refs/*.wav
+pipeline/spill/
+
+# Stray pip/shell artifacts, e.g. `pip install numpy<=1.26.4` without quotes
+# redirecting into a file literally named "=1.26.4".
+=*
+
+# IDE / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Logs
+*.log
+
+# Claude Code local state (keep shared config such as .claude/settings.json)
+.claude/scheduled_tasks.lock
+.claude/settings.local.json

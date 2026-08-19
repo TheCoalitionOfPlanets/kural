@@ -1,0 +1,18 @@
+# Root venv (venv/) — Python 3.14. Hosts capture, the orchestrator and the
+# SraVaani STT worker. Pins frozen from the working environment.
+#
+# torch/torchvision are NOT listed here: they are cu132 wheels that only exist
+# on the PyTorch CUDA index, and download.sh installs them separately.
+transformers==5.15.0
+tokenizers==0.22.2
+huggingface_hub==1.28.0
+hf-xet==1.6.0
+safetensors==0.8.0
+sentencepiece==0.2.2
+numpy==2.5.2
+
+# Orchestrator: capture, playback, config, VAD.
+sounddevice==0.5.6
+soundfile==0.14.0
+PyYAML==6.0.3
+webrtcvad==2.0.10

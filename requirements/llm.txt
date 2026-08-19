@@ -1,0 +1,18 @@
+# reasoning/venv — Python 3.12. Hosts the Gemma 3 4B worker.
+#
+# Separate from the root venv because the two model stacks pin incompatible
+# CUDA torch builds (cu130 here, cu132 there). torch/torchvision come from the
+# PyTorch CUDA index in download.sh, not from this file.
+transformers==5.15.0
+tokenizers==0.22.2
+huggingface_hub==1.28.0
+hf-xet==1.6.0
+safetensors==0.8.0
+accelerate==1.14.0
+
+# 4-bit NF4 quantization — realtime.yaml sets llm.load_in_4bit: true so all
+# three models fit in 12GB. Without this the worker cannot start in that mode.
+bitsandbytes==0.50.1
+
+numpy==2.5.2
+psutil==7.2.2

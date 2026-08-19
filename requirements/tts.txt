@@ -1,0 +1,15 @@
+# tts/venv — Python 3.12. Hosts the Piper TTS worker.
+#
+# Piper runs on CPU through onnxruntime, so no CUDA torch is needed at
+# runtime. Deliberately minimal: the development environment also carried an
+# IndicF5/F5-TTS stack (~150 packages) from an earlier TTS approach that the
+# Piper worker does not import.
+piper-tts==1.7.0
+onnxruntime==1.29.0
+numpy==2.5.2
+
+# Loudness normalization — tts.normalize in realtime.yaml (echo reduction
+# layer 1). The worker degrades gracefully without it, but the echo loop is
+# noticeably worse.
+pyloudnorm==0.2.0
+soundfile==0.14.0
