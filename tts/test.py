@@ -1,101 +1,86 @@
-"""Standalone Piper smoke test — synthesis outside the pipeline.
+"""Manual smoke test for the Indic-Mio TTS worker's synthesis path.
 
-    tts\\venv\\Scripts\\python.exe tts\\test.py            # default (english)
-    tts\\venv\\Scripts\\python.exe tts\\test.py hindi      # a specific language
+Run with tts/venv's interpreter, from the repo root:
 
-Uses the same voice directory the pipeline uses, so if this sounds right the
-pipeline will too. Piper runs on CPU, so this needs no GPU.
+    tts/venv/bin/python tts/test.py
+
+Loads the model and codec directly (not through the JSON-lines subprocess
+protocol) and writes a handful of short utterances to tts/out/ so you can
+listen to them.
 """
 import sys
+import time
 import wave
 from pathlib import Path
 
-from piper import PiperVoice
+ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT / "pipeline" / "workers"))
 
-HERE = Path(__file__).resolve().parent
-VOICES_DIR = HERE / "models" / "export"
+import worker_tts  # noqa: E402
 
-# Mirrors tts.voices in pipeline/config/realtime.yaml. Languages with no Piper
-# voice upstream (Tamil, Kannada, Gujarati, Punjabi, Odia, ...) are absent
-# here for the same reason they are absent there.
-VOICES = {
-    "english": "en_lessac_medium",
-    "hindi": "hi_official_v1",
-    "malayalam": "ml_meera",
-    "telugu": "te_maya",
-    "urdu": "ur_fasih",
-    "bengali": "bn_google",
-    "marathi": "mr_google",
-    "nepali": "ne_google",
-    "spanish": "es_davefx",
-    "french": "fr_siwis",
-    "german": "de_thorsten",
-    "chinese": "zh_huayan",
-    "russian": "ru_irina",
-    "arabic": "ar_kareem",
-    "portuguese": "pt_faber",
-    "italian": "it_paola",
-    "korean": "ko_kss",
-}
-
-PROMPTS = {
-    "english": "The meaning of life is found in the journey, not the destination.",
-    "hindi": "जीवन का अर्थ यात्रा में है, मंज़िल में नहीं।",
-    "malayalam": "ജീവിതത്തിന്റെ അർത്ഥം യാത്രയിലാണ്, ലക്ഷ്യത്തിലല്ല.",
-    "telugu": "జీవితం యొక్క అర్థం ప్రయాణంలో ఉంది, గమ్యంలో కాదు.",
-    "spanish": "El sentido de la vida está en el viaje, no en el destino.",
-    "french": "Le sens de la vie est dans le voyage, pas dans la destination.",
-    "german": "Der Sinn des Lebens liegt in der Reise, nicht im Ziel.",
-}
+SAMPLES = [
+    ("english", "Hello! This is a test of the new text to speech voice."),
+    ("hindi", "नमस्ते, आप कैसे हैं?"),
+    ("tamil", "வணக்கம், நீங்கள் எப்படி இருக்கிறீர்கள்?"),
+]
 
 
 def main():
-    lang = (sys.argv[1] if len(sys.argv) > 1 else "english").lower()
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+    from miocodec import MioCodec
 
-    print("=" * 60)
-    print("PIPER TEST")
-    print("=" * 60)
+    model_dir = ROOT / "tts" / "models" / "Indic-Mio"
+    codec_dir = ROOT / "tts" / "models" / "MioCodec-25Hz-24kHz"
 
-    if lang not in VOICES:
-        print(f"No Piper voice for {lang!r}.", file=sys.stderr)
-        print("Available:", ", ".join(sorted(VOICES)), file=sys.stderr)
-        return 1
+    print(f"loading {model_dir} ...")
+    t0 = time.time()
+    tokenizer = AutoTokenizer.from_pretrained(str(model_dir), trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained(
+        str(model_dir), dtype=torch.bfloat16, device_map="cuda:0",
+    )
+    model.eval()
+    codec = MioCodec.from_pretrained(str(codec_dir))
+    print(f"loaded in {time.time() - t0:.2f}s")
 
-    voice_path = VOICES_DIR / VOICES[lang] / "voice.onnx"
-    if not voice_path.is_file():
-        print(f"Voice not found at {voice_path}", file=sys.stderr)
-        print("Run: bash tts/download_voices.sh", file=sys.stderr)
-        return 1
+    out_dir = ROOT / "tts" / "out"
+    out_dir.mkdir(exist_ok=True)
 
-    text = PROMPTS.get(lang, PROMPTS["english"])
-    output = HERE / f"output_{lang}.wav"
+    for lang, text in SAMPLES:
+        messages = [{"role": "user", "content": text}]
+        prompt = tokenizer.apply_chat_template(
+            messages, tokenize=False, add_generation_prompt=True
+        )
+        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+        t = time.time()
+        with torch.inference_mode():
+            output = model.generate(
+                **inputs, max_new_tokens=1024, temperature=0.9, top_p=0.9,
+            )
+        generated = output[0][inputs["input_ids"].shape[1]:]
+        audio_codes = [
+            tok.item() - worker_tts.SPEECH_OFFSET for tok in generated
+            if worker_tts.SPEECH_OFFSET <= tok.item()
+            < worker_tts.SPEECH_OFFSET + worker_tts.SPEECH_RANGE
+        ]
+        if not audio_codes:
+            print(f"[{lang}] no audio tokens generated")
+            continue
 
-    print("Language:", lang)
-    print("Voice:", voice_path)
-    print("\nLoading voice...")
-    voice = PiperVoice.load(str(voice_path))
-    print("Voice loaded successfully!")
+        codes_tensor = torch.tensor([audio_codes], dtype=torch.long).unsqueeze(0)
+        wav = codec.decode(codes_tensor)
+        audio = wav.squeeze().to(torch.float32).cpu().numpy()
 
-    print("\nGenerating speech...")
-    rate = voice.config.sample_rate
-    frames = []
-    for chunk in voice.synthesize(text):
-        frames.append(chunk.audio_int16_bytes)
-        rate = getattr(chunk, "sample_rate", rate)
-
-    with wave.open(str(output), "wb") as fh:
-        fh.setnchannels(1)
-        fh.setsampwidth(2)
-        fh.setframerate(rate)
-        fh.writeframes(b"".join(frames))
-
-    total = sum(len(f) for f in frames) // 2
-    print("\nDone!")
-    print("Output:", output)
-    print("Sample rate:", rate)
-    print("Duration: %.2fs" % (total / rate))
-    return 0
+        out_path = out_dir / f"{lang}.wav"
+        pcm = (audio.clip(-1.0, 1.0) * 32767.0).astype("int16")
+        with wave.open(str(out_path), "wb") as fh:
+            fh.setnchannels(1)
+            fh.setsampwidth(2)
+            fh.setframerate(worker_tts.SAMPLE_RATE)
+            fh.writeframes(pcm.tobytes())
+        print(f"[{lang}] {len(audio) / worker_tts.SAMPLE_RATE:.2f}s audio -> "
+              f"{out_path} ({time.time() - t:.2f}s)")
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()

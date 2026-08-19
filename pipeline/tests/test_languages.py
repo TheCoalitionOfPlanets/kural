@@ -59,8 +59,6 @@ expect("kya kar rahe ho", "hindi")
 expect("mujhe ek baat batao", "hindi")
 expect("aap kaise hain", "hindi")
 expect("nenu bagunnanu ela unnaru", "telugu")
-expect("hola como estas", "spanish")
-expect("muy bien gracias por favor", "spanish")
 
 print("\ncode-switching stays english")
 # A borrowed word or two is not a language change.
@@ -123,9 +121,13 @@ for _lang in ("tamil", "hindi", "telugu"):
     check(f"{_lang} still has enough markers", len(_ROMANIZED[_lang]) >= 20)
 
 print("\nsupported set")
-for lang in ("tamil", "hindi", "telugu", "kannada", "malayalam", "spanish",
-             ENGLISH):
+for lang in ("tamil", "hindi", "telugu", "kannada", "malayalam", ENGLISH):
     check(f"{lang} supported", lang in SUPPORTED)
+
+print("\nspanish dropped — no longer a TTS-supported language")
+check("spanish not in supported set", "spanish" not in SUPPORTED)
+check("hola como estas no longer detected as spanish",
+      detect_language("hola como estas") != "spanish")
 
 print()
 if failures:

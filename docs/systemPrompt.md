@@ -139,9 +139,9 @@ languages with no script-capable voice.
 
 It is currently **unreachable**: `_NON_LATIN_UNVOICED` in
 [languages.py](../pipeline/realtime/languages.py) is an empty frozenset, since
-every supported language now has a real voice (Piper, or AI4Bharat Indic-TTS
-for Tamil). The code stays as the policy for any future language added
-without a voice.
+every supported language now has a real voice — a single Indic-Mio model
+covers all 22 scheduled Indian languages plus English, including Tamil. The
+code stays as the policy for any future language added without a voice.
 
 ---
 

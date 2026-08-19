@@ -1,7 +1,0 @@
-# Extra deps for tts/convert_coqui_to_piper.py, which builds the Kannada voice
-# from the SYSPIN Coqui VITS checkpoint. Needed only at setup time, not at
-# runtime — download.sh installs these into tts/venv only when building the
-# Kannada voice (--with-kannada, the default).
-#
-# CPU torch is enough: the conversion reshapes weights, it does not train.
-torch==2.13.0
