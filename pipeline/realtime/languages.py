@@ -29,9 +29,12 @@ _SCRIPT_RANGES = [
     ("gujarati", 0x0A80, 0x0AFF),
     ("odia", 0x0B00, 0x0B7F),
     ("punjabi", 0x0A00, 0x0A7F),
-    ("sinhala", 0x0D80, 0x0DFF),
+    ("sinhala", 0x0D80, 0x0DFF),    # not one of Indic-Mio's languages; no voice
     # Devanagari and Bengali each carry several languages; the majority case is
-    # named, since script alone cannot separate them.
+    # named, since script alone cannot separate them. Indic-Mio speaks all of
+    # these natively (Marathi, Sanskrit, Nepali, Konkani, Maithili, Dogri,
+    # Assamese, ...), so bucketing them under "hindi"/"bengali" no longer
+    # costs a wrong-language voice — TTS simply speaks the majority language.
     ("hindi", 0x0900, 0x097F),      # also Marathi, Sanskrit, Nepali, Konkani
     ("bengali", 0x0980, 0x09FF),    # also Assamese
     ("urdu", 0x0600, 0x06FF),       # Perso-Arabic
@@ -81,13 +84,6 @@ _ROMANIZED = {
         "nee", "ningal", "avan", "aval", "illa", "alla", "athe", "sari",
         "orupad", "kurach", "aara", "evide", "eppo", "namaskaram", "nandi",
         "parayu", "para", "vaa", "വരൂ", "ariyilla", "ariyam",
-    },
-    "spanish": {
-        "que", "como", "estas", "esta", "soy", "eres", "yo", "tu", "usted",
-        "nosotros", "hola", "gracias", "por", "favor", "buenos", "dias",
-        "noches", "tardes", "si", "muy", "poco", "donde", "cuando",
-        "quien", "porque", "pero", "tambien", "ahora", "puedes", "puedo",
-        "quiero", "necesito", "hablar", "entiendo", "bien", "mal",
     },
 }
 

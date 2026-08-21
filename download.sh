@@ -10,15 +10,15 @@
 #
 # WHY THREE VENVS
 # The three model stacks pin incompatible dependencies — STT wants Python 3.14
-# with a cu132 torch, the LLM wants 3.12 with cu130, and Piper wants no CUDA
-# torch at all. They cannot share one interpreter, so each stage runs as a
-# subprocess in its own venv (see pipeline/README.md).
+# with a cu132 torch, and both the LLM and TTS want 3.12 with cu130 but are
+# kept in separate venvs regardless (see pipeline/README.md). They cannot
+# share one interpreter, so each stage runs as a subprocess in its own venv.
 #
 # BEFORE RUNNING YOU NEED
 #   * Python 3.14 and Python 3.12 on PATH (see PYTHON VERSIONS below)
 #   * curl or wget
 #   * ~25 GB free disk, and an NVIDIA GPU with 12 GB VRAM to actually run it
-#   * A Hugging Face account and token, because BOTH large models are gated:
+#   * A Hugging Face account and token, because two of the models are gated:
 #       - google/gemma-3-4b-it       accept the Gemma license on the model page
 #       - ARTPARK-IISc/SraVaani-1.0  request access on the model page
 #     Then either run `hf auth login`, or export HF_TOKEN=hf_xxx.
@@ -26,11 +26,9 @@
 # OPTIONS
 #   --skip-venvs    Reuse existing venvs; do not create or install.
 #   --skip-models   Set up venvs only; download no model weights.
-#   --skip-voices   Skip the Piper voices (tts/download_voices.sh).
-#   --no-kannada    Skip building the Kannada voice (saves a torch install).
 #   --cpu           Install CPU torch everywhere. The pipeline will not run
-#                   (STT and the LLM both set require_cuda), but this makes the
-#                   repo installable on a machine with no NVIDIA GPU.
+#                   (STT, the LLM, and TTS all set require_cuda), but this
+#                   makes the repo installable on a machine with no NVIDIA GPU.
 #   -h, --help      Show this help.
 set -euo pipefail
 
@@ -39,21 +37,17 @@ cd "$ROOT"
 
 SKIP_VENVS=0
 SKIP_MODELS=0
-SKIP_VOICES=0
-WITH_KANNADA=1
 CPU_ONLY=0
 
 usage() {
   # The comment block above is the help text, so the two cannot drift apart.
-  sed -n '3,34p' "$0" | sed 's/^#\{1,2\} \{0,1\}//'
+  sed -n '3,32p' "$0" | sed 's/^#\{1,2\} \{0,1\}//'
 }
 
 while [ $# -gt 0 ]; do
   case "$1" in
     --skip-venvs)  SKIP_VENVS=1 ;;
     --skip-models) SKIP_MODELS=1 ;;
-    --skip-voices) SKIP_VOICES=1 ;;
-    --no-kannada)  WITH_KANNADA=0 ;;
     --cpu)         CPU_ONLY=1 ;;
     -h|--help)     usage; exit 0 ;;
     *) echo "Unknown option: $1 (try --help)" >&2; exit 2 ;;
@@ -178,21 +172,10 @@ else
   step "reasoning/venv — Gemma 3 4B (Python 3.12)"
   make_venv "$ROOT/reasoning/venv" "$PY312" "$ROOT/requirements/llm.txt" "$TORCH_LLM" "$TORCH_LLM_INDEX"
 
-  step "tts/venv — Piper (Python 3.12, CPU only)"
-  # No torch spec: Piper synthesizes through onnxruntime and needs no CUDA torch.
-  make_venv "$ROOT/tts/venv" "$PY312" "$ROOT/requirements/tts.txt"
-
-  if [ "$WITH_KANNADA" -eq 1 ] && [ "$SKIP_MODELS" -eq 0 ] && [ "$SKIP_VOICES" -eq 0 ]; then
-    if [ -f "$ROOT/tts/models/export/kn_syspin/voice.onnx" ]; then
-      skip "Kannada converter deps (voice already built)"
-    else
-      info "installing the Kannada converter's torch (CPU) — used once, at setup"
-      KN_PY="$(venv_python "$ROOT/tts/venv")"
-      "$KN_PY" -m pip install --quiet --index-url https://download.pytorch.org/whl/cpu \
-        -r "$ROOT/requirements/tts-convert.txt" \
-        || warn "Converter torch failed to install; the Kannada voice will be skipped."
-    fi
-  fi
+  step "tts/venv — Indic-Mio (Python 3.12)"
+  # Indic-Mio is a causal LM like the reasoning stack, so it shares the same
+  # cu130 torch build rather than needing a build of its own.
+  make_venv "$ROOT/tts/venv" "$PY312" "$ROOT/requirements/tts.txt" "$TORCH_LLM" "$TORCH_LLM_INDEX"
 fi
 
 # ----------------------------------------------------------------- models ---
@@ -265,14 +248,21 @@ else
       "Gemma 3 4B IT" "*.json,*.safetensors,*.model,*.txt,*.md"
   fi
 
-  # Piper voices. Delegated to the existing script, which also builds the
-  # Kannada voice by converting the SYSPIN Coqui checkpoint.
-  step "TTS voices — Piper (~20 voices, ~60 MB each)"
-  if [ "$SKIP_VOICES" -eq 1 ]; then
-    skip "--skip-voices"
+  # Indic-Mio — a ~1.2 GB bf16 causal LM, plus the MioCodec decoder it needs
+  # to turn generated audio tokens into a waveform. Neither repo is gated.
+  step "TTS model — SPRINGLab/Indic-Mio (~1.2 GB)"
+  if [ -f "$ROOT/tts/models/Indic-Mio/model.safetensors" ]; then
+    skip "tts/models/Indic-Mio already populated"
   else
-    bash "$ROOT/tts/download_voices.sh"
-    ok "voices exported to tts/models/export"
+    hf_download "SPRINGLab/Indic-Mio" "$ROOT/tts/models/Indic-Mio" "Indic-Mio TTS"
+  fi
+
+  step "TTS codec — Aratako/MioCodec-25Hz-24kHz"
+  if [ -d "$ROOT/tts/models/MioCodec-25Hz-24kHz" ] \
+      && [ -n "$(ls -A "$ROOT/tts/models/MioCodec-25Hz-24kHz" 2>/dev/null)" ]; then
+    skip "tts/models/MioCodec-25Hz-24kHz already populated"
+  else
+    hf_download "Aratako/MioCodec-25Hz-24kHz" "$ROOT/tts/models/MioCodec-25Hz-24kHz" "MioCodec"
   fi
 fi
 
@@ -295,8 +285,8 @@ check_import "$ROOT/venv" "root venv  (torch, transformers, sounddevice)" \
   "torch, transformers, sounddevice, yaml" || FAILED=1
 check_import "$ROOT/reasoning/venv" "reasoning  (torch, transformers, bitsandbytes)" \
   "torch, transformers, bitsandbytes" || FAILED=1
-check_import "$ROOT/tts/venv" "tts        (piper, onnxruntime)" \
-  "piper, onnxruntime" || FAILED=1
+check_import "$ROOT/tts/venv" "tts        (torch, transformers, miocodec)" \
+  "torch, transformers, miocodec" || FAILED=1
 
 if [ "$SKIP_MODELS" -eq 0 ]; then
   if [ -f "$ROOT/stt/models/model-asr.fp16.ts" ]; then ok "STT weights"
@@ -305,11 +295,8 @@ if [ "$SKIP_MODELS" -eq 0 ]; then
   if [ -f "$ROOT/reasoning/models/gemma-3-4b-it/model.safetensors.index.json" ]; then ok "LLM weights"
   else warn "LLM weights missing"; FAILED=1; fi
 
-  if [ "$SKIP_VOICES" -eq 0 ]; then
-    N=$(find "$ROOT/tts/models/export" -name voice.onnx 2>/dev/null | wc -l | tr -d ' ')
-    if [ "$N" -gt 0 ]; then ok "$N Piper voices"
-    else warn "no Piper voices"; FAILED=1; fi
-  fi
+  if [ -f "$ROOT/tts/models/Indic-Mio/model.safetensors" ]; then ok "TTS weights"
+  else warn "TTS weights missing"; FAILED=1; fi
 fi
 
 # CUDA is what the pipeline actually requires at run time — stt.require_cuda

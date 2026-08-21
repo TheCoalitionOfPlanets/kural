@@ -1,12 +1,20 @@
-# tts/venv — Python 3.12. Hosts the Piper TTS worker.
+# tts/venv — Python 3.12. Hosts the Indic-Mio TTS worker.
 #
-# Piper runs on CPU through onnxruntime, so no CUDA torch is needed at
-# runtime. Deliberately minimal: the development environment also carried an
-# IndicF5/F5-TTS stack (~150 packages) from an earlier TTS approach that the
-# Piper worker does not import.
-piper-tts==1.7.0
-onnxruntime==1.29.0
+# Indic-Mio is a standard transformers causal LM (Qwen3-based), so this pins
+# the same transformers/torch family as reasoning/venv. torch/torchvision
+# come from the PyTorch CUDA index in download.sh, not from this file.
+transformers==5.15.0
+tokenizers==0.22.2
+huggingface_hub==1.28.0
+hf-xet==1.6.0
+safetensors==0.8.0
+accelerate==1.14.0
+
 numpy==2.5.2
+
+# Speech-token decoding — turns Indic-Mio's generated audio codes into a
+# waveform. Not on PyPI; installed straight from Aratako's repo.
+miocodec @ git+https://github.com/Aratako/MioCodec
 
 # Loudness normalization — tts.normalize in realtime.yaml (echo reduction
 # layer 1). The worker degrades gracefully without it, but the echo loop is

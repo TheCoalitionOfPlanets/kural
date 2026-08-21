@@ -3,7 +3,7 @@
 Always-listening voice loop:
 
 ```
-mic → VAD → SraVaani STT → Gemma 3 4B → Piper TTS → speaker
+mic → VAD → SraVaani STT → Gemma 3 4B → Indic-Mio TTS → speaker
 ```
 
 ## Running
@@ -31,7 +31,7 @@ interpreter:
 |---|---|---|
 | STT (SraVaani) | `venv/` | Python 3.14, transformers 5.15 |
 | Reasoning (Gemma 3 4B) | `reasoning/venv/` | Python 3.12, transformers 5.15 |
-| TTS (Piper) | `tts/venv/` | Python 3.12, piper-tts (onnxruntime, CPU) |
+| TTS (Indic-Mio) | `tts/venv/` | Python 3.12, transformers 5.15 (cu130 torch) |
 
 So each model is hosted in a child process in its own venv, speaking JSON-lines
 over stdin/stdout (`realtime/proc.py`). The orchestrator owns capture, queues,
@@ -45,11 +45,12 @@ All three models stay resident on one 12 GB card:
 |---|---|
 | SraVaani STT | 1.7 GB |
 | Gemma 3 4B (4-bit NF4) | 3.0 GB |
-| Piper TTS | 0 GB* |
-| **Total** | **~4.7 GB** |
+| Indic-Mio TTS (bf16) | ~1.5 GB* |
+| **Total** | **~6.2 GB** |
 
-\* Piper runs on CPU through onnxruntime, so it uses no VRAM at all. Each
-voice is a ~60 MB ONNX file held in host RAM, loaded on first use and cached.
+\* Indic-Mio is a 0.6B causal LM held resident on the GPU like STT and the
+LLM, not a per-voice file loaded lazily on CPU — the exact figure is reported
+in the `tts` worker's `ready` event (`vram_gb`) at startup.
 
 Gemma is quantized specifically so all three fit; at bf16 it alone takes 8 GB.
 Set `llm.load_in_4bit: false` in the config to trade VRAM for quality.
@@ -65,12 +66,13 @@ For a short utterance, warm:
 | TTS | not yet re-measured |
 | **Total** | — |
 
-The TTS row needs re-measuring after the Piper swap. Piper is a small VITS
-model synthesizing roughly an order of magnitude faster than real time on CPU,
-so TTS is no longer the dominant cost and reply length is once again the main
-lever. `llm.max_new_tokens` and a brief system prompt are therefore the tuning
-knobs, and both remain tuned for brevity in `config/realtime.yaml`. A voice's
-first use also pays a one-off ~0.3 s load, after which it stays cached.
+The TTS row needs re-measuring after the Indic-Mio swap. Unlike Piper's
+non-autoregressive VITS, Indic-Mio generates audio tokens autoregressively —
+each reply pays a `model.generate()` cost proportional to the audio produced,
+reported per-utterance as `elapsed_s` in the `tts` event. `llm.max_new_tokens`
+and a brief system prompt remain the tuning knobs for reply length, and both
+stay tuned for brevity in `config/realtime.yaml`; `tts.max_new_tokens` bounds
+how much audio a single reply can generate.
 
 ## Echo reduction
 
@@ -156,35 +158,27 @@ the language is decided in code:
    outweigh any instruction.
 
 A stray borrowed word does not count as a switch — "send it to my machan" stays
-English. Detection covers English, Spanish, Tamil, Hindi, Telugu, Kannada,
-Malayalam, Bengali, Gujarati, Punjabi, Odia, Urdu. Set `llm.enforce_language:
-false` to fall back to prompt-only behavior.
+English. Detection covers English, Tamil, Hindi, Telugu, Kannada, Malayalam,
+Bengali, Gujarati, Punjabi, Odia, Urdu. Set `llm.enforce_language: false` to
+fall back to prompt-only behavior.
 
-The TTS voice switches with the language: a Piper voice *is* a language, so
-the detected reply language selects the checkpoint (`tts.voices` in the
-config).
+Unlike Piper, TTS is not a per-language voice file: Indic-Mio is a single
+0.6B model (fine-tuned from
+[Aratako/MioTTS-0.6B](https://huggingface.co/Aratako/MioTTS-0.6B)) that
+infers the language directly from the script of the reply text and speaks
+all 22 scheduled Indian languages plus English from one set of weights — no
+`tts.voices` map, no per-language checkpoint to install. Generated audio
+tokens are decoded to a waveform by
+[Aratako/MioCodec-25Hz-24kHz](https://huggingface.co/Aratako/MioCodec-25Hz-24kHz).
 
-Voices exist for English, Tamil, Hindi, Malayalam, Telugu, Urdu, Bengali,
-Marathi and Nepali, plus a core international set. Tamil is not in the official
-`rhasspy/piper-voices` repo — it comes from the community
-[Jeyaram-K/piper-tamil-voices](https://huggingface.co/Jeyaram-K/piper-tamil-voices)
-(Apache-2.0), in standard Piper format. Two are installed: `ta_valluvar`
-(default, trained far longer) and `ta_hemalatha`.
+A language outside that set (e.g. Sinhala, which the detector recognizes but
+Indic-Mio does not speak) still gets the same `no_voice` handling as before:
+the worker returns `{"ok": false, "error": "no_voice"}` and the orchestrator
+prints the reply as text instead, rather than reading it aloud in the wrong
+language.
 
-Kannada has no Piper voice in any repo. It is built instead by converting the
-[SYSPIN](https://huggingface.co/SYSPIN/vits_Kannada_Female) (IISc Bangalore,
-MIT) Coqui VITS checkpoint with `tts/convert_coqui_to_piper.py` — Piper is VITS
-too, and that model is character-based, so the generator weights transfer
-directly and the Coqui charset becomes the phoneme_id_map. `download_voices.sh`
-runs the conversion for you.
-
-**Gujarati, Punjabi, Odia and Assamese still have no usable voice.** Replies in
-those languages are not spoken — the worker returns `no_voice` and the
-orchestrator prints the reply as text instead. That is deliberate: reading them
-aloud with a wrong-language voice mispronounces every word, which is worse than
-staying silent.
-
-Run `bash tts/download_voices.sh` to fetch the voices.
+Run `bash download.sh --skip-venvs` (or a full `bash download.sh`) to fetch
+the model and codec weights into `tts/models/`.
 
 ## Tuning
 

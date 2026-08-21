@@ -69,48 +69,18 @@ llm:
 tts:
   python: tts/venv/Scripts/python.exe
   worker: pipeline/workers/worker_tts.py
-  # Piper is a small VITS synthesizer running on CPU via onnxruntime, so it
-  # leaves the GPU entirely to STT and the LLM.
-  device: cpu
-  require_cuda: false
-  voices_dir: tts/models/export
-  default_language: english
-  # A Piper voice IS a language — there is no single model to condition, so the
-  # reply's detected language selects a checkpoint. Names are the export dirs
-  # created by tts/download_voices.sh.
-  #
-  # Languages absent here have no usable voice (Gujarati, Punjabi, Odia,
-  # Assamese and others). Replies in those languages are not spoken: the
-  # worker returns `no_voice` and the text is shown instead, which beats a
-  # wrong-language voice mispronouncing every word.
-  voices:
-    english: en_lessac_medium
-    # Tamil is not in the official Piper repo; ta_valluvar comes from a
-    # community repo. Swap to ta_hemalatha for the alternate voice.
-    tamil: ta_valluvar
-    # Kannada has no Piper voice at all; this one is converted from the
-    # SYSPIN (IISc) Coqui VITS checkpoint by tts/convert_coqui_to_piper.py.
-    kannada: kn_syspin
-    hindi: hi_official_v1
-    malayalam: ml_meera
-    telugu: te_maya
-    urdu: ur_fasih
-    bengali: bn_google
-    marathi: mr_google
-    nepali: ne_google
-    spanish: es_davefx
-    french: fr_siwis
-    german: de_thorsten
-    chinese: zh_huayan
-    russian: ru_irina
-    arabic: ar_kareem
-    portuguese: pt_faber
-    italian: it_paola
-    korean: ko_kss
-  # Piper's knobs. length_scale is the speed lever: >1 slower, <1 faster.
-  length_scale: 1.0
-  noise_scale: 0.667      # prosody variation; lower is flatter and steadier
-  noise_w_scale: 0.8      # phoneme-duration variation
+  # Indic-Mio is a 0.6B causal LM — small enough to sit on the same card as
+  # STT and the LLM, and autoregressive generation on CPU would be far slower
+  # than Piper's non-autoregressive VITS ever was.
+  device: cuda:0
+  require_cuda: true
+  model_dir: tts/models/Indic-Mio
+  codec_dir: tts/models/MioCodec-25Hz-24kHz
+  # Generation knobs, straight from the model card. Every extra token here is
+  # also more synthesis latency, same as the LLM's max_new_tokens.
+  max_new_tokens: 1024
+  temperature: 0.9
+  top_p: 0.9
   # Echo reduction layer 1. The feedback loop is acoustic, so amplitude is the
   # most effective software lever. If replies are too quiet, raise the *system*
   # volume — a quiet signal amplified downstream keeps a better
