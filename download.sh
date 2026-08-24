@@ -17,11 +17,21 @@
 # BEFORE RUNNING YOU NEED
 #   * Python 3.14 and Python 3.12 on PATH (see PYTHON VERSIONS below)
 #   * curl or wget
-#   * ~25 GB free disk, and an NVIDIA GPU with 12 GB VRAM to actually run it
+#   * ~27 GB free disk, and an NVIDIA GPU with 12 GB VRAM to actually run it
 #   * A Hugging Face account and token, because two of the models are gated:
 #       - google/gemma-3-4b-it       accept the Gemma license on the model page
 #       - ARTPARK-IISc/SraVaani-1.0  request access on the model page
 #     Then either run `hf auth login`, or export HF_TOKEN=hf_xxx.
+#
+# OPTIONAL — INTERNATIONAL LANGUAGES
+#   The local models are Indic: they hear and speak the scheduled Indian
+#   languages plus English, and nothing else. Spanish, Russian, Japanese and
+#   the rest are routed to ElevenLabs instead. To enable that, export an API
+#   key before running the pipeline:
+#       export ELEVENLABS_API_KEY=sk_xxx
+#   Without it everything still works — Indic and English turns are unaffected
+#   — and international turns are reported as unavailable rather than
+#   transcribed into gibberish by a model that cannot hear them.
 #
 # OPTIONS
 #   --skip-venvs    Reuse existing venvs; do not create or install.
@@ -41,7 +51,7 @@ CPU_ONLY=0
 
 usage() {
   # The comment block above is the help text, so the two cannot drift apart.
-  sed -n '3,32p' "$0" | sed 's/^#\{1,2\} \{0,1\}//'
+  sed -n '3,42p' "$0" | sed 's/^#\{1,2\} \{0,1\}//'
 }
 
 while [ $# -gt 0 ]; do
@@ -236,6 +246,26 @@ else
     hf_download "ARTPARK-IISc/SraVaani-1.0" "$ROOT/stt/models" "SraVaani STT"
   fi
 
+  # MMS-LID — the language gate in front of SraVaani. It decides, from the
+  # waveform alone, whether a turn is one the local Indic models can handle or
+  # one that belongs to ElevenLabs. Not gated, and not required: without it the
+  # pipeline routes everything locally, exactly as it did before.
+  step "Language ID — facebook/mms-lid-126 (~1.2 GB)"
+  if [ -d "$ROOT/stt/models/mms-lid-126" ] \
+      && ls "$ROOT/stt/models/mms-lid-126"/*.safetensors \
+             "$ROOT/stt/models/mms-lid-126"/*.bin >/dev/null 2>&1; then
+    skip "stt/models/mms-lid-126 already populated"
+  else
+    hf_download "facebook/mms-lid-126" "$ROOT/stt/models/mms-lid-126" \
+      "MMS language ID" "*.json,*.safetensors"
+    # Older repos ship only a .bin, and asking for both formats up front would
+    # download the weights twice on the repos that carry both.
+    if ! ls "$ROOT/stt/models/mms-lid-126"/*.safetensors >/dev/null 2>&1; then
+      hf_download "facebook/mms-lid-126" "$ROOT/stt/models/mms-lid-126" \
+        "MMS language ID (pytorch weights)" "*.json,*.bin"
+    fi
+  fi
+
   # Gemma 3 4B IT — ~8.6 GB of bf16 safetensors on disk, quantized to 4-bit
   # NF4 at load time so all three models fit in 12 GB.
   step "LLM — google/gemma-3-4b-it (~8.6 GB)"
@@ -297,6 +327,24 @@ if [ "$SKIP_MODELS" -eq 0 ]; then
 
   if [ -f "$ROOT/tts/models/Indic-Mio/model.safetensors" ]; then ok "TTS weights"
   else warn "TTS weights missing"; FAILED=1; fi
+
+  # Optional, so a miss is a warning that does not fail the run: the pipeline
+  # is fully functional for Indic and English without it.
+  if ls "$ROOT/stt/models/mms-lid-126"/*.safetensors \
+        "$ROOT/stt/models/mms-lid-126"/*.bin >/dev/null 2>&1; then
+    ok "language ID weights"
+  else
+    warn "language ID weights missing — international languages will be routed"
+    warn "  to the local Indic models, which cannot transcribe them"
+  fi
+
+  if [ -n "${ELEVENLABS_API_KEY:-}" ]; then
+    ok "ELEVENLABS_API_KEY is set"
+  else
+    warn "ELEVENLABS_API_KEY is not set — Spanish, Russian, Japanese and other"
+    warn "  non-Indic languages will have no ear and no voice. Indic and"
+    warn "  English are unaffected."
+  fi
 fi
 
 # CUDA is what the pipeline actually requires at run time — stt.require_cuda

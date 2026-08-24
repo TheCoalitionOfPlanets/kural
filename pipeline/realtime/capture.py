@@ -1,20 +1,103 @@
-"""Mic capture and VAD endpointing.
+"""Capture and VAD endpointing.
 
 The sounddevice callback does nothing but append to a deque — running VAD or
 any I/O inside it causes overruns and dropped audio. A separate thread pops
 frames and drives the endpointing state machine.
+
+Where those frames come from is pluggable. The endpointing, the barge-in gate
+and the echo handling below are the tuned part and are identical either way;
+only the source differs:
+
+* `MicSource` — a local sounddevice input stream, the terminal pipeline.
+* `StreamSource` — frames pushed in from outside, which is how the browser
+  feeds this over a WebSocket.
+
+`sounddevice` is imported lazily inside `MicSource` so the server can run on a
+machine with no audio devices at all.
 """
 import collections
 import itertools
 import queue
 import threading
 import time
-from typing import Optional
 
 import numpy as np
-import sounddevice as sd
 
 from .messages import Utterance
+
+
+class MicSource:
+    """A local microphone, via sounddevice. The original behaviour."""
+
+    def __init__(self, device=None):
+        if device in (None, "default"):
+            device = None
+        self.device = device
+        self._stream = None
+
+    def start(self, sample_rate, frame_samples, deliver, on_status):
+        import sounddevice as sd
+
+        def _callback(indata, frames, time_info, status):
+            if status:
+                on_status("audio", str(status))
+            deliver(indata[:, 0].copy())
+
+        self._stream = sd.InputStream(
+            samplerate=sample_rate,
+            channels=1,
+            dtype="float32",
+            blocksize=frame_samples,
+            device=self.device,
+            callback=_callback,
+        )
+        self._stream.start()
+
+    def stop(self):
+        if self._stream is not None:
+            self._stream.stop()
+            self._stream.close()
+            self._stream = None
+
+
+class StreamSource:
+    """Frames pushed in from outside — a WebSocket, a file, a test.
+
+    The VAD is frame-size sensitive: webrtcvad accepts only exact 10/20/30 ms
+    frames, and the energy gate's thresholds are calibrated against a fixed
+    frame length. Whatever arrives is therefore re-chunked to exactly
+    `frame_samples` here rather than trusted to be aligned — a browser's
+    AudioWorklet emits 128-sample blocks, which never divides evenly into a
+    20 ms frame at any sample rate anyone uses.
+    """
+
+    def __init__(self):
+        self._deliver = None
+        self._frame_samples = 0
+        self._buf = np.zeros(0, dtype=np.float32)
+        self._lock = threading.Lock()
+
+    def start(self, sample_rate, frame_samples, deliver, on_status):
+        with self._lock:
+            self._deliver = deliver
+            self._frame_samples = frame_samples
+            self._buf = np.zeros(0, dtype=np.float32)
+
+    def push(self, pcm):
+        """Feed arbitrary-length float32 mono audio; emits whole frames."""
+        with self._lock:
+            if self._deliver is None or not self._frame_samples:
+                return
+            self._buf = np.concatenate((self._buf, np.asarray(pcm, dtype=np.float32)))
+            n = self._frame_samples
+            while len(self._buf) >= n:
+                self._deliver(self._buf[:n].copy())
+                self._buf = self._buf[n:]
+
+    def stop(self):
+        with self._lock:
+            self._deliver = None
+            self._buf = np.zeros(0, dtype=np.float32)
 
 
 class _EnergyVAD:
@@ -118,9 +201,12 @@ class CaptureThread(threading.Thread):
     """
 
     def __init__(self, cfg, audio_queue, stop_event, on_status=None,
-                 speaking_event=None, interrupt=None):
+                 speaking_event=None, interrupt=None, source=None):
         super().__init__(name="capture", daemon=True)
         self.cfg = cfg
+        # Defaults to the local microphone, so the terminal pipeline is
+        # unchanged. The server passes a StreamSource instead.
+        self.source = source if source is not None else MicSource(cfg.get("device"))
         self.audio_queue = audio_queue
         self.stop_event = stop_event
         self.on_status = on_status or (lambda *a, **k: None)
@@ -162,30 +248,19 @@ class CaptureThread(threading.Thread):
         self._counter = itertools.count(1)
         self._dropped_frames = 0
 
-    # -- audio device ------------------------------------------------------
+    # -- audio source ------------------------------------------------------
 
-    def _callback(self, indata, frames, time_info, status):
-        if status:
-            self.on_status("audio", str(status))
+    def _deliver(self, frame):
+        """Hand one frame to the VAD thread. Called on the source's thread.
+
+        Never blocks: this runs on a device callback or a socket reader, and
+        stalling either corrupts the stream. A full ring buffer means the VAD
+        thread has fallen behind, and dropping is the lesser harm.
+        """
         try:
-            self._frames.put_nowait(indata[:, 0].copy())
+            self._frames.put_nowait(frame)
         except queue.Full:
-            # Ring buffer overflow: the VAD thread is not keeping up. Dropping
-            # here is still better than blocking the device callback.
             self._dropped_frames += 1
-
-    def _open_stream(self):
-        device = self.cfg.get("device")
-        if device in (None, "default"):
-            device = None
-        return sd.InputStream(
-            samplerate=self.sample_rate,
-            channels=1,
-            dtype="float32",
-            blocksize=self.frame_samples,
-            device=device,
-            callback=self._callback,
-        )
 
     # -- endpointing -------------------------------------------------------
 
@@ -238,7 +313,9 @@ class CaptureThread(threading.Thread):
         return utt
 
     def run(self):
-        with self._open_stream():
+        self.source.start(self.sample_rate, self.frame_samples,
+                          self._deliver, self.on_status)
+        try:
             self._calibrate()
             self.on_status("listening")
 
@@ -374,6 +451,10 @@ class CaptureThread(threading.Thread):
                     barged = False
                     barge_run = 0
                     silence_run = 0
+        finally:
+            # Leaving a PortAudio stream open locks the mic until the process
+            # is killed, so this has to happen on every exit path.
+            self.source.stop()
 
         if self._dropped_frames:
             self.on_status("frame_drops", count=self._dropped_frames)

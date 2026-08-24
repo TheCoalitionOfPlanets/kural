@@ -30,6 +30,14 @@ class Sentence:
     utt_id: str
     text: str
     t_captured: float
+    # The language the STT stage identified, from the waveform rather than from
+    # the words. Carried instead of re-detected because the text alone cannot
+    # recover it: a Spanish transcript is Latin script with no markers, and
+    # detect_language() would call it English. None when nothing identified it,
+    # which puts the LLM worker back on transcript-based detection.
+    lang: Optional[str] = None
+    # "sravaani" or "elevenlabs" — for the console, not for any decision.
+    backend: Optional[str] = None
     t_stt_done: float = 0.0
     barge_in: bool = False
 
@@ -41,9 +49,10 @@ class Reply:
     text: str
     prompt: str            # kept for the latency log
     t_captured: float
-    # A Piper voice is per-language, so TTS needs to know which language the
-    # reply is in. The LLM stage already decides this to enforce the reply
-    # language, so it is carried forward rather than re-detected downstream.
+    # TTS needs to know which language the reply is in — it is what chooses
+    # between the local voice and ElevenLabs (languages.route_for). The LLM
+    # stage already decides this to enforce the reply language, so it is
+    # carried forward rather than re-detected downstream.
     lang: Optional[str] = None
     t_stt_done: float = 0.0
     t_llm_done: float = 0.0

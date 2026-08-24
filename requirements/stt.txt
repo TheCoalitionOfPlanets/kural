@@ -11,8 +11,19 @@ safetensors==0.8.0
 sentencepiece==0.2.2
 numpy==2.5.2
 
+# The language gate (facebook/mms-lid-126) and the ElevenLabs client add no
+# pins of their own: MMS-LID is a plain transformers Wav2Vec2 classifier, and
+# realtime/elevenlabs.py posts over stdlib urllib rather than pulling `requests`
+# into all three venvs to send one form.
+
 # Orchestrator: capture, playback, config, VAD.
 sounddevice==0.5.6
 soundfile==0.14.0
 PyYAML==6.0.3
 webrtcvad==2.0.10
+
+# The WebSocket front end (pipeline/server/), which lets the browser in web/ be
+# the microphone and the speakers. Not needed for the terminal pipeline —
+# `run_realtime.py` imports none of this.
+fastapi==0.141.1
+uvicorn[standard]==0.52.4

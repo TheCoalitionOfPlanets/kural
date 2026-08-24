@@ -3,14 +3,40 @@
 Always-listening voice loop:
 
 ```
-mic → VAD → SraVaani STT → Gemma 3 4B → Indic-Mio TTS → speaker
+                        ┌ SraVaani STT ┐                ┌ Indic-Mio TTS ┐
+mic → VAD → language ID ┤              ├→ Gemma 3 4B →  ┤               ├→ speaker
+                        └ ElevenLabs   ┘                └ ElevenLabs    ┘
 ```
 
+The local models are Indic: they hear and speak the 22 scheduled Indian
+languages plus English. Anything else — Spanish, Russian, Japanese — is routed
+to ElevenLabs, per utterance, decided from the waveform before transcription.
+See [Reply language](#reply-language) and
+[docs/internationalLanguages.md](../docs/internationalLanguages.md).
+
 ## Running
+
+Two front ends over the same pipeline.
+
+**Terminal** — the machine's own microphone and speakers:
 
 ```bat
 venv\Scripts\python.exe pipeline\run_realtime.py
 ```
+
+**Browser** — a ChatGPT-voice-style interface, where the tab is the microphone
+and the speakers:
+
+```bat
+venv\Scripts\python.exe -m pipeline.server
+cd web && npm install && npm run dev
+```
+
+They share everything but the two ends: `realtime/session.py` builds one graph,
+and only the frame source and the player differ (`MicSource`/`Player` vs
+`StreamSource`/`WebPlayer`). The VAD, barge-in, echo guard and language gate are
+the same code either way. See [web/README.md](../web/README.md) and
+[docs/webInterface.md](../docs/webInterface.md).
 
 Speak, pause, and the reply is spoken back. `Ctrl+C` shuts down cleanly and
 releases the mic.
@@ -44,13 +70,18 @@ All three models stay resident on one 12 GB card:
 | Model | VRAM |
 |---|---|
 | SraVaani STT | 1.7 GB |
+| MMS-LID 126 (fp32) | ~1.2 GB† |
 | Gemma 3 4B (4-bit NF4) | 3.0 GB |
 | Indic-Mio TTS (bf16) | ~1.5 GB* |
-| **Total** | **~6.2 GB** |
+| **Total** | **~7.4 GB** |
 
 \* Indic-Mio is a 0.6B causal LM held resident on the GPU like STT and the
 LLM, not a per-voice file loaded lazily on CPU — the exact figure is reported
 in the `tts` worker's `ready` event (`vram_gb`) at startup.
+
+† The language gate that routes international turns to ElevenLabs. Optional:
+set `stt.lid.enabled: false` (or skip the download) to reclaim it and route
+every turn locally. `stt.lid.dtype: float16` halves it if VRAM is tight.
 
 Gemma is quantized specifically so all three fit; at bf16 it alone takes 8 GB.
 Set `llm.load_in_4bit: false` in the config to trade VRAM for quality.
@@ -145,22 +176,89 @@ The prompt asks for this, but a 4B model does not reliably obey — it was
 observed identifying "epdi irukka" as Tamil and then answering in English. So
 the language is decided in code:
 
-1. [languages.py](realtime/languages.py) detects the language from the
-   transcript. Native script is unambiguous (a Tamil character proves Tamil).
-   Romanized input ("enna panra", "kya kar rahe ho") is scored against
-   per-language function words — the grammatical machinery a speaker cannot
-   avoid.
-2. A directive naming that language is appended to the system prompt *and*
+1. The language is identified **from the audio**, before transcription, by
+   `facebook/mms-lid-126` in the STT worker. Where that abstains — a very short
+   utterance, a low-confidence prediction — [languages.py](realtime/languages.py)
+   falls back to the transcript: native script is unambiguous (a Tamil
+   character proves Tamil), and romanized input ("enna panra", "kya kar rahe
+   ho") is scored against per-language function words, the grammatical
+   machinery a speaker cannot avoid.
+2. That language travels with the turn — `Sentence.lang` → `Reply.lang` — and
+   is never re-derived downstream. It cannot be: a Spanish transcript is Latin
+   script with no markers, and the text-based detector reads it as English.
+3. A directive naming that language is appended to the system prompt *and*
    restated just before the user turn. Position beats emphasis: a rule next to
    where generation starts is followed far more reliably than one in the middle
    of a long prompt.
-3. Switching language clears history, since several turns in the old language
+4. Switching language clears history, since several turns in the old language
    outweigh any instruction.
 
 A stray borrowed word does not count as a switch — "send it to my machan" stays
-English. Detection covers English, Tamil, Hindi, Telugu, Kannada, Malayalam,
-Bengali, Gujarati, Punjabi, Odia, Urdu. Set `llm.enforce_language: false` to
-fall back to prompt-only behavior.
+English. Set `llm.enforce_language: false` to fall back to prompt-only
+behavior.
+
+## International languages
+
+**The same rule, one stack further out.** Speak Spanish and you are answered in
+Spanish, in a Spanish voice.
+
+The local models cannot do this and never will: SraVaani hears the scheduled
+Indian languages plus English, Indic-Mio speaks the same set. So that set is
+"local" and its complement is "international", and international turns are
+served by ElevenLabs — Scribe for the ear, `eleven_multilingual_v2` for the
+voice. `route_for()` in [languages.py](realtime/languages.py) is the single
+place that decision is made.
+
+The hard part is *knowing*. Handed Spanish, SraVaani does not fail — it returns
+confident Devanagari gibberish — so the transcript cannot reveal that it should
+never have been made. The decision therefore comes from the waveform, before
+transcription:
+
+```
+        ┌──────────────┐   indic / english   ┌──────────────┐
+audio ─▶│  MMS-LID 126 │────────────────────▶│  SraVaani    │─▶ transcript
+        │  (one pass)  │                     └──────────────┘
+        └───────┬──────┘   anything else     ┌──────────────┐
+                └────────────────────────────▶│  Scribe      │─▶ transcript
+                                             └──────────────┘
+```
+
+Everything after that point is unchanged. The reply comes back as a WAV either
+way, loudness-normalized by the same code, played by the same player, and
+guarded by the same VAD gate, echo guard and barge-in — an international reply
+is interruptible exactly like a local one.
+
+Four details do the real work:
+
+- **Failing toward local.** Below `stt.lid.min_confidence` the gate declines to
+  commit and the turn stays local. A wrong local route costs one bad
+  transcript; a wrong international route costs an API call, and on a
+  mostly-Indic pipeline the ambiguous turns are mostly Indic.
+- **Hysteresis that only confirms.** A conversation in Spanish survives one
+  mumbled sentence (`stt.lid.sticky_ttl_s`), but a *confident* Tamil prediction
+  wins immediately — switching back to an Indian language lands on the very
+  next sentence, never after a delay.
+- **Scribe outranks LID.** LID picks the route; Scribe heard the words, so its
+  language is what the turn runs on. A misroute repairs itself: LID says
+  Spanish, Scribe says Tamil, and TTS goes straight back to the local voice.
+- **The voice is chosen by the reply, not the route.** TTS calls `route_for()`
+  on the reply's language, so the two halves cannot disagree.
+
+Both halves fail soft. Without the LID weights every turn routes locally, as it
+did before this existed; without `$ELEVENLABS_API_KEY` international turns are
+reported rather than transcribed into gibberish. Either way Indic and English
+are untouched, and both are stated at startup rather than discovered mid-
+sentence.
+
+```bash
+export ELEVENLABS_API_KEY=sk_xxx
+```
+
+Scribe hears more languages than the multilingual voice speaks — Sinhala,
+Vietnamese, Thai, Hebrew, Hungarian, Norwegian, Persian, Swahili, Afrikaans.
+Those get the existing text-only treatment: the reply is printed, not
+mispronounced. Full design in
+[docs/internationalLanguages.md](../docs/internationalLanguages.md).
 
 Unlike Piper, TTS is not a per-language voice file: Indic-Mio is a single
 0.6B model (fine-tuned from
@@ -202,6 +300,20 @@ onset is prepended so the leading phoneme survives.
 
 **Replies too long/slow** — lower `llm.max_new_tokens`.
 
+**Spanish (or Russian, or Japanese) comes out as Indic gibberish** — the LID
+gate did not fire. Check the startup line: if it says language ID is off, the
+weights are missing (`bash download.sh --skip-venvs`). Otherwise lower
+`stt.lid.min_confidence` toward `0.4`, or raise `stt.lid.min_audio_s` if the
+turns are short.
+
+**Indic turns are being sent to ElevenLabs** — raise `stt.lid.min_confidence`
+toward `0.7`. Every international route is a paid call, and the `heard (… via
+elevenlabs)` tag on the transcript line is how you spot them.
+
+**International replies cut themselves off** — the same fix as any other
+self-interrupt, since both voices share the normalizer: lower
+`tts.normalize.target_lufs`, or raise `capture.vad.barge_in_energy_multiplier`.
+
 ## Files
 
 ```
@@ -211,18 +323,24 @@ pipeline/
 ├── config/prompts/        system prompt (edit and restart)
 ├── realtime/
 │   ├── messages.py        Utterance, Sentence, Reply, WavJob
-│   ├── capture.py         mic reader + VAD endpointing state machine
+│   ├── capture.py         VAD endpointing + pluggable frame sources
 │   ├── proc.py            subprocess model host (JSON-lines protocol)
 │   ├── workers.py         stage threads: STT → LLM → TTS → playback
 │   ├── echo_guard.py      text-level self-hearing detection
-│   ├── languages.py       reply-language detection and per-turn directive
+│   ├── languages.py       language detection, stack routing, reply directive
+│   ├── elevenlabs.py      stdlib-only HTTP client for the international path
 │   ├── speakable.py       strips what a TTS voice cannot say
 │   └── audio_out.py       blocking, strictly serial playback
+├── realtime/
+│   ├── session.py         the one wiring both front ends share
+│   └── web_player.py      playback in a browser, behind Player's interface
 ├── workers/
-│   ├── worker_stt.py      runs in venv/
+│   ├── worker_stt.py      runs in venv/ — SraVaani + the LID gate + Scribe
 │   ├── worker_llm.py      runs in reasoning/venv/
-│   └── worker_tts.py      runs in tts/venv/
+│   └── worker_tts.py      runs in tts/venv/ — Indic-Mio + the ElevenLabs voice
+├── server/app.py          WebSocket front end for web/
 ├── tests/                 run each file directly with venv's python
+│   └── stub_server.py     the server with the models faked — no GPU needed
 └── spill/                 scratch audio, deleted after playback
 ```
 

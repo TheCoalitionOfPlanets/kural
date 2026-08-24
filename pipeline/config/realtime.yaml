@@ -45,6 +45,46 @@ stt:
   model_dir: stt/models
   device: cuda
   require_cuda: true
+  # -- the language gate ---------------------------------------------------
+  # SraVaani is an Indic ASR. Given Spanish it does not fail — it returns
+  # confident Devanagari gibberish — so the transcript cannot be used to notice
+  # that it should never have been made. The decision has to come from the
+  # waveform, before transcription, which is what this is: one small forward
+  # pass that picks the ear.
+  #
+  #   indic / english  ->  SraVaani, locally, free
+  #   anything else    ->  ElevenLabs Scribe (see the elevenlabs section)
+  #
+  # With the model missing or enabled: false, every turn routes locally and the
+  # pipeline behaves exactly as it did before this path existed.
+  lid:
+    enabled: true
+    model_dir: stt/models/mms-lid-126
+    dtype: float32         # float16 halves the ~1.2GB if VRAM is tight
+    # Below this the prediction is not trusted and the turn stays local.
+    # Failing toward local is deliberate: a wrong local route costs one bad
+    # transcript, a wrong international route costs an API call — and on a
+    # mostly-Indic pipeline the ambiguous turns are mostly Indic. Raise it to
+    # spend less; lower it if international speech is being missed.
+    min_confidence: 0.55
+    # LID on a fragment is a coin flip, and short turns ("yes", "mm", "wait")
+    # are overwhelmingly in the language already being spoken.
+    min_audio_s: 0.7
+    # LID needs a few seconds, not the whole turn. Capping keeps a 15s
+    # utterance as cheap to classify as a 3s one.
+    max_audio_s: 5.0
+    # Hysteresis: once someone is speaking Spanish they keep speaking Spanish,
+    # and one dip below min_confidence should not drop them onto an ear that
+    # cannot hear them. This only ever confirms a low-confidence prediction
+    # that already agrees with the previous turn — it can never override a
+    # confident one, so switching back to Tamil still takes effect on the very
+    # next sentence. 0 disables it.
+    sticky_ttl_s: 60
+    # Above this, the detected language is passed to Scribe as a hint. Below
+    # it Scribe detects on its own, since a confident wrong hint is worse than
+    # none — and Scribe's answer is what the rest of the turn runs on either
+    # way.
+    hint_confidence: 0.85
 
 llm:
   python: reasoning/venv/Scripts/python.exe
@@ -88,6 +128,46 @@ tts:
   normalize:
     target_lufs: -23.0     # null to disable; -16 is typical streaming loudness
     peak: 0.7              # hard ceiling after loudness normalization
+
+elevenlabs:
+  # The international ear and voice. Read by two workers — STT and TTS — from
+  # this one section, so the two halves of the path cannot drift apart.
+  #
+  # WHICH TURNS COME HERE is not configured: it is whatever the local models
+  # cannot handle. SraVaani hears the scheduled Indian languages plus English
+  # and Indic-Mio speaks the same set, so that set is "local" and its
+  # complement is "international" (pipeline/realtime/languages.py, LOCAL).
+  # Speak Tamil and nothing below is touched; speak Spanish and it all is.
+  enabled: true
+  # The key is read from the environment, never from this file — config is
+  # committed, keys are not. Unset means the international path is unavailable,
+  # which is reported at startup and per-turn rather than failing silently.
+  api_key_env: ELEVENLABS_API_KEY
+
+  # Scribe is ElevenLabs' only speech-to-text model. It detects the language
+  # itself, and its answer outranks the local LID gate's — which is how a
+  # misrouted turn repairs itself: LID says Spanish, Scribe says Tamil, and the
+  # reply comes back in the local voice.
+  stt_model: scribe_v1
+
+  # eleven_multilingual_v2: 29 languages, the highest-quality tier. The
+  # flash/turbo v2.5 models cut roughly a second off each reply if the latency
+  # matters more than the voice does.
+  tts_model: eleven_multilingual_v2
+  voice_id: 21m00Tcm4TlvDq8ikWAM   # Rachel — a stock voice on every account
+  # Raw PCM, not MP3: nothing in this pipeline can decode a compressed stream,
+  # and the reply has to reach the loudness normalizer as samples. pcm_44100
+  # needs a Pro subscription; 24kHz is plenty for speech through one speaker.
+  output_format: pcm_24000
+  voice_settings:
+    stability: 0.5
+    similarity_boost: 0.75
+
+  # Every retry is silence the user is sitting through, so this is deliberately
+  # low. Only rate limits, 5xx and transport failures are retried — a bad key
+  # or a bad request returns the same answer however many times it is asked.
+  retries: 1
+  timeout_s: 20            # per call; stt_timeout_s / tts_timeout_s override
 
 barge_in:
   # Let the user interrupt a reply in progress. Requires echo.guard: the mic
@@ -135,6 +215,24 @@ echo:
 playback:
   device: default
   keep_wavs: false
+
+server:
+  # The WebSocket front end (pipeline/server/app.py), for the Next.js app in
+  # web/. The browser becomes the microphone and the speakers; everything
+  # between them — VAD, barge-in, the echo guard, the language gate — is the
+  # same code the terminal pipeline runs.
+  host: 127.0.0.1        # 0.0.0.0 to reach it from another device on the LAN
+  port: 8000
+  # Which origins may call /health. WebSockets are not subject to CORS, but
+  # /health is what the UI polls to decide whether its start button works — so
+  # a too-narrow list here shows up as a permanent "Server offline" in front of
+  # a perfectly healthy server.
+  #
+  # Left unset, any loopback origin on any port is allowed, because the dev
+  # port is not knowable: Next moves to another one whenever 3000 is taken.
+  # Set an explicit list when the server is exposed beyond this machine.
+  # allow_origins:
+  #   - https://voice.example.com
 
 runtime:
   spill_dir: pipeline/spill

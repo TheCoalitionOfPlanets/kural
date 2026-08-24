@@ -70,3 +70,16 @@ desktop.ini
 # Claude Code local state (keep shared config such as .claude/settings.json)
 .claude/scheduled_tasks.lock
 .claude/settings.local.json
+
+# Next.js front end (web/). web/.gitignore covers these too; repeating them
+# here means a clone that never runs `npm install` still has a clean status.
+node_modules/
+**/node_modules/
+.next/
+**/.next/
+out/
+next-env.d.ts
+*.tsbuildinfo
+
+# Playwright's downloaded browsers, if PLAYWRIGHT_BROWSERS_PATH points in-repo.
+**/.playwright/

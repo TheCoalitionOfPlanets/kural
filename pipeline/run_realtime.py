@@ -1,10 +1,18 @@
 """Always-listening speech -> reasoning -> speech pipeline.
 
-    mic -> VAD -> [SraVaani STT] -> [Gemma 3 4B] -> [Piper TTS] -> speaker
+    mic -> VAD -> [LID] -> [SraVaani STT ] -> [Gemma 3 4B] -> [Indic-Mio  ] -> speaker
+                           [ElevenLabs   ]                    [ElevenLabs ]
 
 Each model runs as a subprocess in its own venv (their transformers pins are
 mutually incompatible); this process owns capture, the queues, scheduling and
 playback.
+
+The two ears and the two voices are chosen per utterance. The local models are
+Indic by construction, so a turn in Spanish or Japanese is heard and spoken by
+ElevenLabs instead — decided from the waveform by the language-ID gate in the
+STT worker, and from the reply's language at TTS. Everything downstream of
+that choice is identical: one WAV, one player, the same VAD gate, echo guard
+and barge-in.
 
     python pipeline/run_realtime.py
     python pipeline/run_realtime.py --config pipeline/config/realtime.yaml
@@ -23,13 +31,19 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from pipeline.realtime.audio_out import Player
 from pipeline.realtime.capture import CaptureThread
-from pipeline.realtime.echo_guard import RecentSpeech
-from pipeline.realtime.interrupt import InterruptController
-from pipeline.realtime.proc import WorkerProcess
-from pipeline.realtime.workers import LLMStage, PlaybackStage, STTStage, TTSStage
+from pipeline.realtime.session import Session
 
 ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CONFIG = ROOT / "pipeline" / "config" / "realtime.yaml"
+
+# Capture and session events render differently from stage events, and the
+# stage set cannot be enumerated (every "<stage>_failed" is one), so the small
+# closed set is the one named here and everything else falls through.
+_CAPTURE_EVENTS = frozenset({
+    "level", "calibrated", "listening", "speech_start", "utterance", "muted",
+    "unmuted", "barge_in", "dropped", "frame_drops", "audio", "too_short",
+    "worker_starting", "worker_ready", "flushed", "echo_warning",
+})
 
 sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
@@ -97,12 +111,17 @@ def main():
 
     console = Console(log_latency=runtime.get("log_latency", True))
     stop_event = threading.Event()
+    eleven_cfg = cfg.get("elevenlabs") or {}
+    playback_cfg = cfg.get("playback", {})
 
     # -- status routing ----------------------------------------------------
 
     threshold_holder = {"value": 0.0}
 
-    def on_capture(kind, *args, **kw):
+    def on_event(kind, *args, **kw):
+        """Every capture, stage and session event lands here."""
+        if kind not in _CAPTURE_EVENTS:
+            return on_stage(kind, **kw)
         if kind == "level":
             console.meter(kw.get("level", 0.0), threshold_holder["value"])
         elif kind == "calibrated":
@@ -128,18 +147,61 @@ def main():
             console.line(f"  ! {kw['count']} mic frames dropped")
         elif kind == "audio":
             console.line(f"  ! audio status: {args[0] if args else ''}")
+        elif kind == "too_short":
+            pass  # too brief to transcribe; the VAD already moved on
+        elif kind == "worker_starting":
+            print(f"Starting {kw['worker']}...", flush=True)
+        elif kind == "worker_ready":
+            _report_ready(kw)
+        elif kind == "flushed":
+            n = kw["count"]
+            console.line(f"  flushed {n} stale repl{'y' if n == 1 else 'ies'}")
+        elif kind == "echo_warning":
+            console.line(
+                f"  ! echo detected [{kw['utt_id']}] — the assistant heard its "
+                f"own output.\n    If this repeats, lower "
+                f"tts.normalize.target_lufs or raise echo.mute_tail_ms."
+            )
+
+    def _report_ready(info):
+        label = info["worker"]
+        detail = f"  {label} ready in {info.get('load_s')}s"
+        if info.get("vram_gb"):
+            detail += f" ({info['vram_gb']} GB VRAM)"
+        print(detail, flush=True)
+
+        # The international path is optional and fails soft — the pipeline runs
+        # without it, just local-only. That has to be visible here rather than
+        # discovered halfway through a Spanish sentence, so both halves report
+        # whether they actually came up.
+        if info.get("lid") is False:
+            print(f"    ! language ID off ({info.get('lid_error') or 'disabled'})"
+                  f" — every turn routes to the local Indic models", flush=True)
+        if info.get("elevenlabs") is False:
+            missing = "transcribe" if label == "stt" else "speak"
+            print(f"    ! ElevenLabs off — cannot {missing} languages outside "
+                  f"the local set. Set "
+                  f"${eleven_cfg.get('api_key_env', 'ELEVENLABS_API_KEY')}.",
+                  flush=True)
 
     def on_stage(kind, **kw):
         utt = kw.get("utt_id", "")
         if kind == "stt":
-            console.line(f"[{utt}] heard: {kw['text']}")
+            # The backend is named only when it is not the local one. A tag on
+            # every line would be noise; a tag on the international ones is the
+            # only visible sign that a paid call was made.
+            tag = ""
+            if kw.get("backend") == "elevenlabs":
+                tag = f" ({kw.get('lang') or 'international'} via elevenlabs)"
+            console.line(f"[{utt}] heard{tag}: {kw['text']}")
         elif kind == "llm":
             lang = kw.get("lang")
             tag = f" ({lang})" if lang else ""
             console.line(f"[{utt}] reply{tag}: {kw['text']}")
         elif kind == "tts":
+            tag = " via elevenlabs" if kw.get("backend") == "elevenlabs" else ""
             console.line(f"[{utt}] synth {kw.get('audio_s')}s "
-                         f"in {kw.get('elapsed_s')}s")
+                         f"in {kw.get('elapsed_s')}s{tag}")
         elif kind == "latency":
             if console.log_latency:
                 console.line(
@@ -148,6 +210,16 @@ def main():
                 )
         elif kind == "stt_empty":
             console.line(f"[{utt}] no speech recognized")
+        elif kind == "stt_no_international":
+            # Identified as a language the local ear cannot hear, with nowhere
+            # to send it. Transcribing it locally anyway would return confident
+            # gibberish, so the turn is dropped and the reason named.
+            console.line(
+                f"[{utt}] ! {kw.get('lang') or 'international'} speech, but "
+                f"ElevenLabs is not configured — turn dropped. Set "
+                f"${cfg.get('elevenlabs', {}).get('api_key_env', 'ELEVENLABS_API_KEY')}"
+                f" and restart."
+            )
         elif kind == "echo_dropped":
             console.line(f"[{utt}] echo of own output, dropped: {kw['text']}")
         elif kind == "barge_in_confirmed":
@@ -168,10 +240,11 @@ def main():
         elif kind == "barge_in_provisional":
             pass  # already reported by the capture-side "barge_in" event
         elif kind == "tts_no_voice":
-            # Piper has no voice for this language, so the reply is text-only.
+            # Neither voice speaks this language, so the reply is text-only.
             # Print it rather than dropping it silently — the answer is still
             # correct, it just cannot be spoken.
-            console.line(f"[{utt}] no {kw.get('lang')} voice, text only: "
+            why = f" ({kw['reason']})" if kw.get("reason") else ""
+            console.line(f"[{utt}] no {kw.get('lang')} voice{why}, text only: "
                          f"{kw.get('text')}")
         elif kind.endswith("_failed") or kind == "stage_error":
             console.line(f"  ! {kind}: {kw.get('error')}")
@@ -179,57 +252,15 @@ def main():
     def on_worker_log(name, line):
         console.line(f"  [{name}] {line}")
 
-    # -- queues ------------------------------------------------------------
-
-    q = cfg.get("queues", {})
-    audio_q = queue.Queue(maxsize=q.get("audio_queue", {}).get("maxsize", 8))
-    transcript_q = queue.Queue(maxsize=q.get("transcript_queue", {}).get("maxsize", 32))
-    reply_q = queue.Queue(maxsize=q.get("reply_queue", {}).get("maxsize", 32))
-    wav_q = queue.Queue(maxsize=q.get("wav_queue", {}).get("maxsize", 8))
-
-    # Echo reduction and barge-in are the same problem seen from two sides, so
-    # they share state. `speaking_event` marks the assistant as audible; with
-    # barge-in off that means "drop mic frames" (airtight, uninterruptible), and
-    # with it on it means "apply the strict VAD gate" (interruptible, with the
-    # text guard keeping bleed from reaching the model as a user turn).
-    echo_cfg = cfg.get("echo", {})
-    barge_cfg = cfg.get("barge_in", {})
-    barge_in_enabled = bool(barge_cfg.get("enabled", False))
-
-    recent_speech = RecentSpeech(
-        echo_cfg.get("window", 6),
-        ttl_s=float(echo_cfg.get("ttl_s", 30)),
-        ngram=int(echo_cfg.get("ngram", 5)),
-    ) if echo_cfg.get("guard", True) else None
-    echo_threshold = float(echo_cfg.get("threshold", 0.6))
-    mute_tail_s = float(echo_cfg.get("mute_tail_ms", 0)) / 1000.0
-
-    if barge_in_enabled and recent_speech is None:
-        # Tier 1 stops playback on acoustics alone; the text guard is the only
-        # thing that can tell whether it was the user. Without it every bleed
-        # burst that survives the strict gate reaches the model as a user turn
-        # and flushes the pipeline — the self-reply loop, with extra steps.
-        print("barge_in.enabled requires echo.guard — enable echo.guard or "
-              "disable barge_in.", file=sys.stderr)
-        raise SystemExit(1)
-
-    # The mic must stay live during playback for anything to be interruptible,
-    # so barge-in implies the speaking flag is a gate selector, not a mute.
-    speaking_event = threading.Event() if (
-        barge_in_enabled or echo_cfg.get("mute_capture_while_replying", True)
-    ) else None
-
-    interrupt = InterruptController(on_event=lambda k, **kw: on_stage(k, **kw)) \
-        if barge_in_enabled else None
-
-    capture = CaptureThread(cfg["capture"], audio_q, stop_event, on_capture,
-                            speaking_event=speaking_event, interrupt=interrupt)
-
     # -- capture-only mode (build order step 1) ----------------------------
 
     if args.capture_only:
-        import numpy as np
         import soundfile as sf
+
+        # Capture and VAD only — no models, no queues past the first one.
+        q = cfg.get("queues", {})
+        audio_q = queue.Queue(maxsize=q.get("audio_queue", {}).get("maxsize", 8))
+        capture = CaptureThread(cfg["capture"], audio_q, stop_event, on_event)
 
         print("=" * 60)
         print("CAPTURE + VAD ONLY — utterances written to", spill_dir)
@@ -251,126 +282,41 @@ def main():
             capture.join(timeout=2)
         return
 
-    # -- model subprocesses ------------------------------------------------
+    # -- the pipeline ------------------------------------------------------
 
     print("=" * 60)
     print("REAL-TIME SPEECH PIPELINE")
     print("=" * 60)
 
-    timeout_s = int(runtime.get("startup_timeout_s", 300))
-    workers = []
-
-    def spawn(key, label):
-        section = dict(cfg[key])
-        # Config paths are repo-relative; the child resolves them against its
-        # own cwd, so make them absolute here.
-        for path_key in ("prompt_file", "voices_dir"):
-            if section.get(path_key):
-                section[path_key] = str(ROOT / section[path_key])
-        wp = WorkerProcess(
-            name=label,
-            python=ROOT / section["python"],
-            script=ROOT / section["worker"],
-            config=section,
-            cwd=ROOT,
-            on_log=on_worker_log,
-        )
-        print(f"Starting {label}...", flush=True)
-        info = wp.start(timeout_s=timeout_s)
-        detail = f"  {label} ready in {info.get('load_s')}s"
-        if info.get("vram_gb"):
-            detail += f" ({info['vram_gb']} GB VRAM)"
-        print(detail, flush=True)
-        workers.append(wp)
-        return wp
-
     try:
-        stt_worker = spawn("stt", "stt")
-        llm_worker = spawn("llm", "llm")
-        tts_worker = spawn("tts", "tts")
-    except Exception as exc:
-        print(f"\nStartup failed: {exc}", file=sys.stderr)
-        for w in workers:
-            w.stop()
+        session = Session(cfg, ROOT, on_event, Player(playback_cfg.get("device")),
+                          on_worker_log=on_worker_log)
+    except ValueError as exc:
+        print(exc, file=sys.stderr)
         raise SystemExit(1)
 
-    player = Player(cfg.get("playback", {}).get("device"))
-    keep_wavs = bool(cfg.get("playback", {}).get("keep_wavs", False))
-
-    def on_echo(utt_id, text):
-        console.line(
-            f"  ! echo detected [{utt_id}] — the assistant heard its own output.\n"
-            f"    If this repeats, lower tts.normalize.target_lufs or raise "
-            f"echo.mute_tail_ms."
-        )
-
-    def flush_downstream(utt_id):
-        """Drop replies for turns the user has interrupted past.
-
-        Called only on a *confirmed* barge-in. Anything already in the reply or
-        wav queues answers a question the user has moved on from; playing it
-        after they have started a new turn is worse than dropping it.
-
-        transcript_queue is deliberately left alone: an item there is a user
-        turn that has not been answered yet, not a stale reply.
-        """
-        dropped = 0
-        for q_ in (reply_q, wav_q):
-            while True:
-                try:
-                    item = q_.get_nowait()
-                except queue.Empty:
-                    break
-                dropped += 1
-                path = getattr(item, "wav_path", None)
-                if path is not None and not keep_wavs:
-                    path.unlink(missing_ok=True)
-        if dropped:
-            console.line(f"  flushed {dropped} stale repl{'y' if dropped == 1 else 'ies'}")
-
-    stages = [
-        STTStage(stt_worker, spill_dir, audio_q, transcript_q, stop_event, on_stage,
-                 recent_speech=recent_speech, echo_threshold=echo_threshold,
-                 on_echo=on_echo, interrupt=interrupt, on_flush=flush_downstream),
-        LLMStage(llm_worker, transcript_q, reply_q, stop_event, on_stage,
-                 recent_speech=recent_speech),
-        TTSStage(tts_worker, spill_dir, reply_q, wav_q, stop_event, on_stage,
-                 recent_speech=recent_speech),
-        PlaybackStage(player, keep_wavs, wav_q, None, stop_event, on_stage,
-                      speaking_event=speaking_event, mute_tail_s=mute_tail_s,
-                      interrupt=interrupt, recent_speech=recent_speech,
-                      verdict_timeout_s=float(
-                          barge_cfg.get("verdict_timeout_ms", 6000)) / 1000.0),
-    ]
-
-    for s in stages:
-        s.start()
-    capture.start()
+    try:
+        session.start()
+    except Exception as exc:
+        print(f"\nStartup failed: {exc}", file=sys.stderr)
+        session.stop()
+        raise SystemExit(1)
 
     # -- run until interrupted ---------------------------------------------
 
     def handle_sigint(signum, frame):
-        stop_event.set()
+        session.stop_event.set()
 
     signal.signal(signal.SIGINT, handle_sigint)
 
     try:
-        while not stop_event.is_set():
+        while not session.stop_event.is_set():
             time.sleep(0.2)
     except KeyboardInterrupt:
-        stop_event.set()
+        session.stop_event.set()
 
-    # -- clean shutdown (spec §11) -----------------------------------------
-    # Capture first so no new work enters, then let the stages drain, then
-    # close the models. Leaving PortAudio open locks the mic until the
-    # process is killed.
     console.line("\nShutting down...")
-    capture.join(timeout=2)
-    for s in stages:
-        s.join(timeout=5)
-    player.stop()
-    for w in workers:
-        w.stop()
+    session.stop()
     console.line("Stopped.")
 
 

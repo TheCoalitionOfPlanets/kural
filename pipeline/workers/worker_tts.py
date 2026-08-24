@@ -1,4 +1,4 @@
-"""TTS worker — SPRINGLab/Indic-Mio, runs in tts/venv.
+"""TTS worker — two voices behind one protocol, runs in tts/venv.
 
 Indic-Mio is a 0.6B causal LM (fine-tuned from Aratako/MioTTS-0.6B) that
 speaks all 22 scheduled Indian languages plus English from a single set of
@@ -11,6 +11,16 @@ Generation produces ordinary text tokens interleaved with audio tokens in a
 reserved id range; the audio tokens are extracted, shifted back to codec
 codes, and decoded to a waveform by MioCodec.
 
+What Indic-Mio cannot do is speak Spanish, Russian or Japanese — its language
+set stops at India's border. Replies in those languages are synthesized by
+ElevenLabs instead, chosen per utterance by `languages.route_for()` on the
+reply's language. The two backends are deliberately interchangeable below the
+waist: both produce a float32 waveform, both go through the same loudness
+normalization, and both are written to the same WAV. That matters more than it
+looks — `normalize()` is echo-reduction layer 1, and an un-normalized
+international reply would come back hot enough to trip the barge-in gate and
+cut itself off mid-sentence.
+
 Protocol (JSON lines on stdin/stdout):
     <- {"cmd": "init", "config": {...}}
     -> {"event": "ready", ...}
@@ -19,6 +29,7 @@ Protocol (JSON lines on stdin/stdout):
     -> {"ok": false, "utt_id": ..., "error": "no_voice", "lang": ...}
 """
 import json
+import os
 import sys
 import time
 import wave
@@ -31,18 +42,26 @@ import wave
 _PROTOCOL = sys.stdout
 sys.stdout = sys.stderr
 
+# Runs in tts/venv and cannot import the orchestrator package by name, so the
+# shared routing tables are loaded by path — the same trick the LLM and STT
+# workers use. Both modules are stdlib-only for exactly this reason.
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from realtime.elevenlabs import ElevenLabs, ElevenLabsError  # noqa: E402
+from realtime.languages import ROUTE_INTERNATIONAL, has_eleven_voice, route_for  # noqa: E402
+
 # Indic-Mio's supported languages (frontmatter of the model card), mapped to
 # this pipeline's language names from realtime/languages.py. A reply in a
 # language outside this set has no voice, same as Piper's missing-voice gap.
 SUPPORTED_LANGS = frozenset({
     "english", "hindi", "bengali", "marathi", "telugu", "kannada", "tamil",
     "malayalam", "gujarati", "punjabi", "odia", "urdu", "nepali",
-    # Devanagari/Bengali-script languages the pipeline's script-range
-    # detector already buckets under "hindi"/"bengali" (see the comment on
-    # _SCRIPT_RANGES in realtime/languages.py) but that Indic-Mio also
-    # covers natively: Maithili, Assamese, Sanskrit, Konkani, Dogri, Bodo,
-    # Santali, Sindhi, Manipuri, Kashmiri.
-    "assamese",
+    # The script-range detector buckets every Devanagari language under
+    # "hindi" and every Bengali-script one under "bengali", so these names
+    # never used to reach this worker. Audio-level LID names them directly
+    # now, and Indic-Mio speaks all of them natively — so they have to be
+    # listed, or a Marathi reply would be refused as having no voice.
+    "assamese", "sanskrit", "konkani", "maithili", "dogri", "bodo",
+    "santali", "sindhi", "manipuri", "kashmiri",
 })
 
 # Audio tokens occupy a reserved id range above the text vocabulary; the
@@ -165,11 +184,41 @@ def main():
         audio = wav.squeeze().to(torch.float32).cpu().numpy()
         return audio, SAMPLE_RATE
 
+    # -- the international voice -------------------------------------------
+    el_cfg = cfg.get("elevenlabs") or {}
+    client = None
+    if el_cfg.get("enabled", True):
+        try:
+            client = ElevenLabs(
+                os.environ.get(el_cfg.get("api_key_env", "ELEVENLABS_API_KEY"), ""),
+                tts_model=el_cfg.get("tts_model"),
+                voice_id=el_cfg.get("voice_id"),
+                output_format=el_cfg.get("output_format"),
+                voice_settings=el_cfg.get("voice_settings"),
+                timeout_s=el_cfg.get("tts_timeout_s", el_cfg.get("timeout_s", 20)),
+                retries=el_cfg.get("retries", 1),
+            )
+        except ElevenLabsError as exc:
+            log(f"ElevenLabs voice unavailable ({exc}); replies in languages "
+                f"Indic-Mio does not speak will be text-only")
+
+    def synthesize_eleven(text):
+        """Same contract as synthesize(): (float32 mono waveform, sample rate).
+
+        The response is raw little-endian PCM16 rather than MP3, so there is
+        nothing to decode — just a reinterpretation of the same bytes into the
+        float32 the normalizer and the WAV writer already expect.
+        """
+        raw, rate = client.synthesize(text)
+        pcm = np.frombuffer(raw, dtype="<i2")
+        return pcm.astype(np.float32) / 32768.0, rate
+
     emit({
         "event": "ready",
         "load_s": round(load_s, 2),
         "sample_rate": SAMPLE_RATE,
         "languages": sorted(SUPPORTED_LANGS),
+        "elevenlabs": client is not None,
         "vram_gb": round(torch.cuda.memory_allocated() / 1024**3, 2),
     })
 
@@ -186,22 +235,45 @@ def main():
             continue
 
         lang = req.get("lang") or "english"
+        # The reply's own language picks the voice, not the route the *user's*
+        # audio took. They usually agree, but when they do not the reply is
+        # what is about to be spoken — so a turn misrouted to Scribe and then
+        # correctly identified as Tamil still comes back in the local voice.
+        route = route_for(lang)
+        backend = "elevenlabs" if route == ROUTE_INTERNATIONAL else "indic-mio"
         try:
-            if lang not in SUPPORTED_LANGS:
-                # No voice for this language. Say so explicitly rather than
-                # reading the reply aloud in the wrong language, which sounds
-                # like a bug and mispronounces every word.
-                log(f"Indic-Mio has no voice for {lang!r}; utterance not spoken")
+            # Same gap, two voices: a language neither backend speaks is
+            # reported rather than read aloud in the wrong one, which sounds
+            # like a bug and mispronounces every word. The orchestrator prints
+            # the reply as text instead.
+            no_voice = None
+            if route == ROUTE_INTERNATIONAL:
+                if client is None:
+                    no_voice = "elevenlabs is not configured"
+                elif not has_eleven_voice(lang):
+                    no_voice = "not one of the multilingual model's languages"
+            elif lang not in SUPPORTED_LANGS:
+                no_voice = "not one of Indic-Mio's languages"
+
+            if no_voice:
+                log(f"no {backend} voice for {lang!r} ({no_voice}); "
+                    f"utterance not spoken")
                 emit({"ok": False, "utt_id": req.get("utt_id"),
-                      "error": "no_voice", "lang": lang})
+                      "error": "no_voice", "lang": lang, "reason": no_voice})
                 continue
 
             t = time.time()
-            audio, rate = synthesize(req["text"])
+            if route == ROUTE_INTERNATIONAL:
+                audio, rate = synthesize_eleven(req["text"])
+            else:
+                audio, rate = synthesize(req["text"])
             if audio.size == 0:
                 emit({"ok": False, "utt_id": req.get("utt_id"),
                       "error": "empty_audio", "lang": lang})
                 continue
+            # Both backends normalize. Skipping it for ElevenLabs would put a
+            # full-scale reply into a room whose barge-in gate was tuned
+            # against a -23 LUFS one, and the reply would interrupt itself.
             audio = normalize(audio, rate)
 
             # Write int16 via the stdlib rather than pulling in soundfile;
@@ -219,9 +291,17 @@ def main():
                 "wav_path": req["wav_path"],
                 "sample_rate": rate,
                 "lang": lang,
+                "backend": backend,
                 "audio_s": round(len(audio) / rate, 2),
                 "elapsed_s": round(time.time() - t, 3),
             })
+        except ElevenLabsError as exc:
+            # A network failure is not a missing voice: the reply is speakable,
+            # it just could not be fetched. Reported as a plain failure so it
+            # does not read as an unsupported language.
+            log(f"ElevenLabs synthesis failed: {exc}")
+            emit({"ok": False, "utt_id": req.get("utt_id"),
+                  "error": f"elevenlabs_tts: {exc}", "lang": lang})
         except Exception as exc:
             log(f"synthesis failed: {exc!r}")
             emit({"ok": False, "utt_id": req.get("utt_id"), "error": str(exc)})

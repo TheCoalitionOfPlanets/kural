@@ -1,0 +1,64 @@
+.bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px;
+  border-radius: 999px;
+  background: var(--bg-raised);
+  border: 1px solid var(--line);
+  box-shadow: var(--shadow-md);
+}
+
+.btn {
+  display: grid;
+  place-items: center;
+  width: 46px;
+  height: 46px;
+  border-radius: 50%;
+  border: 1px solid var(--line-strong);
+  color: var(--fg);
+  transition: transform 140ms ease, box-shadow 200ms ease,
+              background 160ms ease, border-color 160ms ease;
+}
+
+.btn:hover:not(:disabled) {
+  box-shadow: var(--shadow-sm);
+  border-color: color-mix(in srgb, var(--accent) 50%, transparent);
+}
+
+.btn:active:not(:disabled) { transform: scale(0.94); }
+
+.btn:disabled { opacity: 0.35; cursor: not-allowed; }
+
+.on {
+  background: var(--fg);
+  color: var(--bg);
+  border-color: var(--fg);
+}
+
+.danger {
+  border-color: color-mix(in srgb, var(--danger) 55%, transparent);
+  color: var(--danger);
+}
+
+/* The primary action: wide, blue, and the only filled-accent element. */
+.start {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  height: 46px;
+  padding: 0 22px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #ffffff;
+  font-weight: 550;
+  letter-spacing: 0.01em;
+  box-shadow: var(--shadow-md), var(--glow);
+  transition: transform 140ms ease, box-shadow 220ms ease, opacity 160ms ease;
+}
+
+.start:hover:not(:disabled) { box-shadow: var(--shadow-lg), var(--glow-strong); }
+.start:active:not(:disabled) { transform: scale(0.97); }
+.start:disabled { opacity: 0.45; cursor: not-allowed; box-shadow: var(--shadow-sm); }
+
+.icon { width: 20px; height: 20px; display: block; }

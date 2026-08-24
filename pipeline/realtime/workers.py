@@ -97,7 +97,14 @@ class STTStage(_Stage):
             np.save(pcm_path, utt.pcm)
 
             try:
-                res = self.worker.run({"utt_id": utt.utt_id, "pcm_path": str(pcm_path)})
+                # The rate travels with the audio: the language-ID model and
+                # SraVaani are both 16kHz-only, and a mismatch there is silent
+                # rather than loud, so the worker checks rather than assumes.
+                res = self.worker.run({
+                    "utt_id": utt.utt_id,
+                    "pcm_path": str(pcm_path),
+                    "sample_rate": utt.sample_rate,
+                })
             except Exception as exc:
                 self.on_event("stage_error", stage="stt", error=str(exc))
                 self._resolve(utt, "abandon", "stt_crashed")
@@ -106,7 +113,15 @@ class STTStage(_Stage):
                 pcm_path.unlink(missing_ok=True)
 
             if not res.get("ok"):
-                self.on_event("stt_failed", utt_id=utt.utt_id, error=res.get("error"))
+                if res.get("error") == "no_international_stt":
+                    # Heard, identified, and then nowhere to send it. Reported
+                    # on its own because the fix is a config one — an API key —
+                    # not something wrong with the audio or the model.
+                    self.on_event("stt_no_international", utt_id=utt.utt_id,
+                                  lang=res.get("lang"))
+                else:
+                    self.on_event("stt_failed", utt_id=utt.utt_id,
+                                  error=res.get("error"))
                 self._resolve(utt, "abandon", "stt_failed")
                 continue
 
@@ -138,9 +153,12 @@ class STTStage(_Stage):
             self._resolve(utt, "confirm")
 
             self.on_event("stt", utt_id=utt.utt_id, text=text,
+                          lang=res.get("lang"), backend=res.get("backend"),
+                          confidence=res.get("confidence"),
                           elapsed_s=res.get("elapsed_s"))
             self._put(Sentence(
                 utt_id=utt.utt_id, text=text,
+                lang=res.get("lang"), backend=res.get("backend"),
                 t_captured=utt.t_captured, t_stt_done=time.perf_counter(),
                 barge_in=getattr(utt, "barge_in", False),
             ))
@@ -165,7 +183,14 @@ class LLMStage(_Stage):
                 break
 
             try:
-                res = self.worker.run({"utt_id": sent.utt_id, "text": sent.text})
+                # Forwarded, not re-derived: STT identified this from the audio
+                # (and on the international path from Scribe), which the
+                # transcript alone cannot reproduce.
+                res = self.worker.run({
+                    "utt_id": sent.utt_id,
+                    "text": sent.text,
+                    "lang": sent.lang,
+                })
             except Exception as exc:
                 self.on_event("stage_error", stage="llm", error=str(exc))
                 break
@@ -182,18 +207,25 @@ class LLMStage(_Stage):
             if self.recent_speech is not None:
                 self.recent_speech.add(text)
 
+            lang = res.get("lang") or sent.lang
             self.on_event("llm", utt_id=sent.utt_id, text=text,
-                          lang=res.get("lang"), elapsed_s=res.get("elapsed_s"))
+                          lang=lang, elapsed_s=res.get("elapsed_s"))
             self._put(Reply(
                 utt_id=sent.utt_id, text=text, prompt=sent.text,
-                lang=res.get("lang"),
+                lang=lang,
                 t_captured=sent.t_captured, t_stt_done=sent.t_stt_done,
                 t_llm_done=time.perf_counter(),
             ))
 
 
 class TTSStage(_Stage):
-    """reply_queue -> wav_queue"""
+    """reply_queue -> wav_queue
+
+    One stage, two voices. Which one speaks is decided inside the worker from
+    the reply's language, so nothing here has to know that ElevenLabs exists —
+    a WAV comes back either way, and playback, barge-in and the echo guard
+    treat an international reply exactly like a local one.
+    """
 
     def __init__(self, worker, spill_dir, *args, recent_speech=None):
         super().__init__("tts", *args)
@@ -226,18 +258,19 @@ class TTSStage(_Stage):
                 break
 
             if not res.get("ok"):
-                # No Piper voice for this language is a known gap, not a
+                # A language neither voice speaks is a known gap, not a
                 # failure — surface it as its own event so the reply can still
                 # be shown as text instead of looking like a crash.
                 if res.get("error") == "no_voice":
                     self.on_event("tts_no_voice", utt_id=reply.utt_id,
-                                  lang=res.get("lang"), text=reply.text)
+                                  lang=res.get("lang"), text=reply.text,
+                                  reason=res.get("reason"))
                 else:
                     self.on_event("tts_failed", utt_id=reply.utt_id,
                                   error=res.get("error"))
                 continue
 
-            self.on_event("tts", utt_id=reply.utt_id,
+            self.on_event("tts", utt_id=reply.utt_id, backend=res.get("backend"),
                           elapsed_s=res.get("elapsed_s"), audio_s=res.get("audio_s"))
             self._put(WavJob(
                 utt_id=reply.utt_id, wav_path=Path(res["wav_path"]),
