@@ -1,0 +1,144 @@
+/* Pure white and pure black, with blue doing all the work in between.
+ *
+ * The palette is deliberately two colours and one accent. Every sense of depth
+ * comes from blue-tinted shadow rather than from grey fills, which is what
+ * keeps the white pure white and the black pure black: a grey card would make
+ * the background read as off-white by comparison.
+ *
+ * Both themes are defined as complete token sets. Nothing is left to inherit,
+ * because a half-defined theme is how a page ends up with black text on a
+ * black background for the one viewer whose settings you did not think about.
+ */
+
+:root {
+  --bg: #ffffff;
+  --bg-raised: #ffffff;
+  --fg: #000000;
+  --fg-muted: #52525b;
+  --fg-faint: #a1a1aa;
+
+  --accent: #2563eb;
+  --accent-soft: #3b82f6;
+  --accent-wash: rgba(37, 99, 235, 0.08);
+
+  --line: rgba(0, 0, 0, 0.08);
+  --line-strong: rgba(0, 0, 0, 0.14);
+
+  /* Elevation is blue, not black. Three steps, used consistently. */
+  --shadow-sm: 0 1px 2px rgba(37, 99, 235, 0.08),
+               0 2px 8px rgba(37, 99, 235, 0.06);
+  --shadow-md: 0 2px 6px rgba(37, 99, 235, 0.10),
+               0 8px 28px rgba(37, 99, 235, 0.10);
+  --shadow-lg: 0 8px 24px rgba(37, 99, 235, 0.14),
+               0 24px 64px rgba(37, 99, 235, 0.14);
+  --glow: 0 0 60px rgba(37, 99, 235, 0.22);
+  --glow-strong: 0 0 90px rgba(37, 99, 235, 0.38);
+
+  --danger: #dc2626;
+  --radius: 16px;
+  --radius-sm: 10px;
+}
+
+/* System dark. Guarded so an explicit light choice still wins here. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #000000;
+    --bg-raised: #000000;
+    --fg: #ffffff;
+    --fg-muted: #a1a1aa;
+    --fg-faint: #52525b;
+
+    --accent: #3b82f6;
+    --accent-soft: #60a5fa;
+    --accent-wash: rgba(59, 130, 246, 0.12);
+
+    --line: rgba(255, 255, 255, 0.10);
+    --line-strong: rgba(255, 255, 255, 0.18);
+
+    /* On black, shadow cannot darken — so elevation becomes light. Same three
+     * steps, same blue, emitted instead of cast. */
+    --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.6),
+                 0 0 10px rgba(59, 130, 246, 0.10);
+    --shadow-md: 0 2px 8px rgba(0, 0, 0, 0.7),
+                 0 0 26px rgba(59, 130, 246, 0.16);
+    --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.8),
+                 0 0 60px rgba(59, 130, 246, 0.22);
+    --glow: 0 0 70px rgba(59, 130, 246, 0.34);
+    --glow-strong: 0 0 120px rgba(59, 130, 246, 0.55);
+
+    --danger: #f87171;
+  }
+}
+
+/* Explicit choice, both directions. */
+:root[data-theme="dark"] {
+  --bg: #000000;
+  --bg-raised: #000000;
+  --fg: #ffffff;
+  --fg-muted: #a1a1aa;
+  --fg-faint: #52525b;
+
+  --accent: #3b82f6;
+  --accent-soft: #60a5fa;
+  --accent-wash: rgba(59, 130, 246, 0.12);
+
+  --line: rgba(255, 255, 255, 0.10);
+  --line-strong: rgba(255, 255, 255, 0.18);
+
+  --shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.6),
+               0 0 10px rgba(59, 130, 246, 0.10);
+  --shadow-md: 0 2px 8px rgba(0, 0, 0, 0.7),
+               0 0 26px rgba(59, 130, 246, 0.16);
+  --shadow-lg: 0 8px 32px rgba(0, 0, 0, 0.8),
+               0 0 60px rgba(59, 130, 246, 0.22);
+  --glow: 0 0 70px rgba(59, 130, 246, 0.34);
+  --glow-strong: 0 0 120px rgba(59, 130, 246, 0.55);
+
+  --danger: #f87171;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--fg);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+               "Helvetica Neue", Arial, sans-serif;
+  font-size: 15px;
+  line-height: 1.55;
+  -webkit-font-smoothing: antialiased;
+  overflow: hidden;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+  background: none;
+  border: none;
+  cursor: pointer;
+}
+
+button:focus-visible,
+[tabindex]:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 3px;
+  border-radius: var(--radius-sm);
+}
+
+::selection { background: var(--accent-wash); }
+
+/* Everything below animates. Anyone who has asked not to see that gets a
+ * static page rather than a slower one. */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+  }
+}

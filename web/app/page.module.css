@@ -1,0 +1,77 @@
+.shell {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  height: 100dvh;
+  padding: 26px 0 0;
+  overflow: hidden;
+}
+
+/* A single blue wash behind everything, anchored to the orb. It is the only
+ * thing keeping a pure-white page from reading as an empty document. */
+.shell::before {
+  content: "";
+  position: absolute;
+  top: -10%;
+  left: 50%;
+  transform: translateX(-50%);
+  width: min(120vw, 900px);
+  aspect-ratio: 1;
+  background: radial-gradient(
+    circle at 50% 42%,
+    var(--accent-wash) 0%,
+    transparent 62%
+  );
+  pointer-events: none;
+  z-index: 0;
+}
+
+.brand {
+  position: relative;
+  z-index: 1;
+  font-size: 13px;
+  font-weight: 550;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--fg-faint);
+}
+
+.stage {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 14px;
+  /* Holds the orb still when the transcript opens underneath it — an orb that
+   * jumps on every toggle is the fastest way to make this feel cheap. */
+  flex: 0 0 auto;
+  padding: 14px 0 2px;
+}
+
+.body {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: 100%;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.dock {
+  position: relative;
+  z-index: 2;
+  padding: 12px 0 max(20px, env(safe-area-inset-bottom));
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+}
+
+/* Small screens: the orb gives up room first, since the transcript is what
+ * someone is actually reading when they open it. */
+@media (max-height: 700px) {
+  .stage { gap: 12px; padding: 10px 0 2px; }
+}

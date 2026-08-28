@@ -329,4 +329,7 @@ Clean shutdown means: stop capture, push a sentinel through each queue in order,
 - [01 — Architecture](./01-architecture.md)
 - [02 — Models & fine-tuning](./02-models-and-finetuning.md)
 - [04 — Real-time queue pipeline](./04-realtime-queue-pipeline.md)
+- [internationalLanguages.md](internationalLanguages.md) — the ElevenLabs path
+  for languages the local Indic models cannot hear or speak
+- [webInterface.md](webInterface.md) — running the same pipeline from a browser
 - [pipeline/README.md](../pipeline/README.md)

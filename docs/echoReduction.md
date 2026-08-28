@@ -238,3 +238,17 @@ venv\Scripts\python.exe pipeline\tests\test_echo_guard.py
 venv\Scripts\python.exe pipeline\tests\test_echo_guard_integration.py
 venv\Scripts\python.exe pipeline\tests\test_barge_in.py
 ```
+
+---
+
+## In the browser
+
+The web front end ([webInterface.md](webInterface.md)) requests
+`echoCancellation: true`, and the browser's AEC is better at this than every
+layer below combined — it has the reference signal and can subtract exactly
+what was sent to the speakers.
+
+Nothing here is removed by that. These layers become the second line behind a
+much better first one, which is the right ordering rather than a redundancy:
+the browser's AEC handles the acoustic path, and the text guard still catches
+whatever survives it.

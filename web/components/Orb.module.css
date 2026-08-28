@@ -1,0 +1,165 @@
+/* The orb is the whole interface, so it carries every state the pipeline has.
+ *
+ * Scale and glow are driven by --amp, written directly to the element from a
+ * requestAnimationFrame loop. React never re-renders for amplitude; it only
+ * changes data-state, which switches which animation is running.
+ */
+
+.wrap {
+  position: relative;
+  width: min(46vw, 34vh, 280px);
+  aspect-ratio: 1;
+  display: grid;
+  place-items: center;
+  --amp: 0;
+  /* Amplitude with a floor, so the orb is never completely inert while live. */
+  --lift: calc(0.06 + var(--amp) * 0.34);
+}
+
+/* The bloom. Blurred, behind everything, and the main source of colour. */
+.glow {
+  position: absolute;
+  inset: -18%;
+  border-radius: 50%;
+  background: radial-gradient(
+    circle at 50% 50%,
+    var(--accent) 0%,
+    color-mix(in srgb, var(--accent) 45%, transparent) 38%,
+    transparent 70%
+  );
+  filter: blur(28px);
+  opacity: calc(0.20 + var(--amp) * 0.55);
+  transform: scale(calc(0.9 + var(--lift) * 0.6));
+  transition: opacity 220ms ease;
+}
+
+/* A thin ring that reads as the "edge" of the orb in both themes. */
+.ring {
+  position: absolute;
+  inset: 4%;
+  border-radius: 50%;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, transparent);
+  box-shadow: var(--glow);
+  transform: scale(calc(1 + var(--lift) * 0.16));
+  transition: transform 90ms linear;
+}
+
+/* The solid body: pure fg colour, so black on white and white on black. */
+.core {
+  position: relative;
+  width: 62%;
+  aspect-ratio: 1;
+  border-radius: 50%;
+  background: radial-gradient(
+    circle at 34% 28%,
+    color-mix(in srgb, var(--fg) 92%, var(--accent)) 0%,
+    var(--fg) 58%,
+    color-mix(in srgb, var(--fg) 80%, var(--accent)) 100%
+  );
+  box-shadow: var(--shadow-lg), var(--glow);
+  transform: scale(calc(1 + var(--lift) * 0.24));
+  transition: transform 70ms linear, box-shadow 240ms ease;
+}
+
+/* A specular highlight, which is what stops the core reading as a flat disc. */
+.core::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: radial-gradient(
+    circle at 32% 24%,
+    color-mix(in srgb, var(--bg) 34%, transparent) 0%,
+    transparent 46%
+  );
+}
+
+/* Sweeping arc, used while the pipeline is working on a turn. */
+.sweep {
+  position: absolute;
+  inset: 0;
+  border-radius: 50%;
+  background: conic-gradient(
+    from 0deg,
+    transparent 0deg,
+    transparent 250deg,
+    color-mix(in srgb, var(--accent) 70%, transparent) 320deg,
+    var(--accent) 356deg,
+    transparent 360deg
+  );
+  mask: radial-gradient(circle, transparent 61%, #000 62.5%, #000 65%, transparent 66.5%);
+  -webkit-mask: radial-gradient(circle, transparent 61%, #000 62.5%, #000 65%, transparent 66.5%);
+  opacity: 0;
+  animation: spin 1.15s linear infinite;
+}
+
+@keyframes spin { to { transform: rotate(360deg); } }
+
+@keyframes breathe {
+  0%, 100% { transform: scale(1); opacity: 0.5; }
+  50%      { transform: scale(1.06); opacity: 0.85; }
+}
+
+@keyframes ripple {
+  0%   { transform: scale(1); opacity: 0.55; }
+  100% { transform: scale(1.5); opacity: 0; }
+}
+
+/* -- states ------------------------------------------------------------- */
+
+/* Nothing connected: monochrome, no blue at all, so "live" is unmistakable. */
+.wrap[data-state="idle"] .glow { opacity: 0.05; }
+.wrap[data-state="idle"] .ring {
+  border-color: var(--line-strong);
+  box-shadow: none;
+}
+.wrap[data-state="idle"] .core {
+  background: radial-gradient(circle at 34% 28%,
+    color-mix(in srgb, var(--fg) 70%, var(--bg)) 0%, var(--fg) 70%);
+  box-shadow: var(--shadow-md);
+}
+
+.wrap[data-state="connecting"] .sweep,
+.wrap[data-state="loading"] .sweep,
+.wrap[data-state="thinking"] .sweep { opacity: 1; }
+
+.wrap[data-state="loading"] .sweep { animation-duration: 2.4s; }
+
+.wrap[data-state="calibrating"] .ring,
+.wrap[data-state="listening"] .ring { animation: breathe 3.6s ease-in-out infinite; }
+
+/* Speaking is the loudest state visually as well as acoustically. */
+.wrap[data-state="speaking"] .glow { opacity: calc(0.4 + var(--amp) * 0.6); }
+.wrap[data-state="speaking"] .core { box-shadow: var(--shadow-lg), var(--glow-strong); }
+
+.wrap[data-state="error"] .glow {
+  background: radial-gradient(circle at 50% 50%, var(--danger) 0%, transparent 68%);
+  opacity: 0.22;
+}
+.wrap[data-state="error"] .ring {
+  border-color: color-mix(in srgb, var(--danger) 55%, transparent);
+  box-shadow: none;
+}
+
+/* One expanding ring when the user cuts a reply off — the only feedback that
+ * barge-in was registered, since the audio simply stops. */
+.pulse {
+  position: absolute;
+  inset: 4%;
+  border-radius: 50%;
+  border: 1.5px solid var(--accent);
+  animation: ripple 620ms ease-out forwards;
+  pointer-events: none;
+}
+
+/* The orb is a status indicator, not decoration, so with motion reduced it
+ * must still say which state it is in. Amplitude scaling is fine — it is
+ * driven by sound, not by a timer — but the looping animations go. */
+@media (prefers-reduced-motion: reduce) {
+  .sweep { animation: none; }
+  .wrap[data-state="connecting"] .sweep,
+  .wrap[data-state="loading"] .sweep,
+  .wrap[data-state="thinking"] .sweep { opacity: 0.9; }
+  .ring { animation: none !important; }
+  .pulse { animation: none; opacity: 0; }
+}

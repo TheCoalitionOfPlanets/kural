@@ -6,8 +6,8 @@ CPU-only and uses no VRAM).
 Protocol (JSON lines on stdin/stdout):
     <- {"cmd": "init", "config": {...}}
     -> {"event": "ready", ...}
-    <- {"cmd": "run", "utt_id": ..., "text": ...}
-    -> {"ok": true, "utt_id": ..., "text": ...}
+    <- {"cmd": "run", "utt_id": ..., "text": ..., "lang": ...}
+    -> {"ok": true, "utt_id": ..., "text": ..., "lang": ...}
 """
 import json
 import os
@@ -119,7 +119,17 @@ def main():
             # it explicitly is far more reliable than a 4B model re-inferring
             # it from a short, possibly garbled transcript — it was observed
             # naming the language correctly and still replying in English.
-            lang = detect_language(req["text"]) if enforce_language else None
+            #
+            # Upstream wins when it has an answer. The STT stage identifies the
+            # language from the *audio*, and on the international path gets it
+            # from Scribe, which actually heard the words. Re-deriving it from
+            # the transcript here would be strictly worse and, for a
+            # Latin-script language, plainly wrong: detect_language() has no
+            # markers for Spanish or German, so it calls them English and the
+            # reply comes back in the wrong language with a matching voice.
+            lang = None
+            if enforce_language:
+                lang = req.get("lang") or detect_language(req["text"])
 
             messages = []
             if system_prompt:

@@ -18,6 +18,11 @@ miocodec @ git+https://github.com/Aratako/MioCodec
 
 # Loudness normalization — tts.normalize in realtime.yaml (echo reduction
 # layer 1). The worker degrades gracefully without it, but the echo loop is
-# noticeably worse.
+# noticeably worse. It applies to the ElevenLabs voice too: an un-normalized
+# international reply arrives hot enough to trip the barge-in gate and cut
+# itself off.
+#
+# The ElevenLabs voice itself needs no pin — realtime/elevenlabs.py is stdlib
+# only, and asks for raw PCM so there is no decoder to install.
 pyloudnorm==0.2.0
 soundfile==0.14.0

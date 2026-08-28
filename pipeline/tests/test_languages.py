@@ -1,4 +1,4 @@
-"""Tests for language detection and the reply-language directive.
+"""Tests for language detection, stack routing, and the reply directive.
 
     venv\\Scripts\\python.exe pipeline\\tests\\test_languages.py
 """
@@ -10,9 +10,15 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 from pipeline.realtime.languages import (  # noqa: E402
     ENGLISH,
+    ROUTE_INTERNATIONAL,
+    ROUTE_LOCAL,
     SUPPORTED,
+    RouteGate,
     detect_language,
+    has_eleven_voice,
     language_directive,
+    language_from_code,
+    route_for,
 )
 
 failures = []
@@ -124,10 +130,147 @@ print("\nsupported set")
 for lang in ("tamil", "hindi", "telugu", "kannada", "malayalam", ENGLISH):
     check(f"{lang} supported", lang in SUPPORTED)
 
-print("\nspanish dropped — no longer a TTS-supported language")
-check("spanish not in supported set", "spanish" not in SUPPORTED)
-check("hola como estas no longer detected as spanish",
-      detect_language("hola como estas") != "spanish")
+print("\nnon-Indic scripts — they route abroad, so they must be named")
+expect("Привет, как дела?", "russian")
+expect("こんにちは、元気ですか", "japanese")
+expect("안녕하세요 잘 지내세요", "korean")
+expect("你好，最近怎么样", "chinese")
+expect("Γεια σου, τι κάνεις;", "greek")
+expect("มาลาสวัสดี", "thai")
+
+# Han is shared, so a Japanese sentence lands in both buckets and can lose the
+# majority vote to its own kanji. Kana settle it.
+expect("私は日本語を話します", "japanese")
+
+# Urdu and Arabic share a Unicode block and route to different stacks: Urdu is
+# one of Indic-Mio's languages, Arabic is not.
+expect("آپ کیسے ہیں؟", "urdu")
+expect("مرحبا كيف حالك اليوم", "arabic")
+
+print("\nrouting — which stack owns the turn")
+for _lang in ("tamil", "hindi", "telugu", "kannada", "malayalam", "marathi",
+              "urdu", "assamese", "sanskrit", ENGLISH):
+    check(f"{_lang} -> local", route_for(_lang) == ROUTE_LOCAL)
+
+for _lang in ("spanish", "russian", "japanese", "arabic", "korean", "chinese",
+              "french", "german", "sinhala"):
+    check(f"{_lang} -> elevenlabs", route_for(_lang) == ROUTE_INTERNATIONAL)
+
+# No language established yet is not a reason to spend an API call.
+check("unknown language stays local", route_for(None) == ROUTE_LOCAL)
+check("empty language stays local", route_for("") == ROUTE_LOCAL)
+# Anything the tables have never heard of has no local voice by definition.
+check("unrecognized language routes abroad",
+      route_for("klingon") == ROUTE_INTERNATIONAL)
+
+print("\nlanguage codes — ISO 639-3 from LID, 639-1 from anywhere else")
+for _code, _name in (("spa", "spanish"), ("rus", "russian"), ("jpn", "japanese"),
+                     ("tam", "tamil"), ("eng", ENGLISH), ("mar", "marathi"),
+                     ("ory", "odia"), ("cmn", "chinese"),
+                     ("es", "spanish"), ("ja", "japanese"), ("ta", "tamil")):
+    check(f"{_code} -> {_name}", language_from_code(_code) == _name)
+
+# Regional tags arrive from Scribe as "es-ES" / "spa-Latn"; only the primary
+# subtag names the language.
+check("es-ES -> spanish", language_from_code("es-ES") == "spanish")
+check("spa-Latn -> spanish", language_from_code("spa-Latn") == "spanish")
+check("no code -> nothing", language_from_code(None) is None)
+# An unmapped code must survive rather than be silently called English: it is
+# not in LOCAL, so it still routes to the stack that might handle it.
+check("unknown code kept as-is", language_from_code("qqq") == "qqq")
+
+print("\ntts coverage — heard is not the same as speakable")
+check("spanish has an elevenlabs voice", has_eleven_voice("spanish"))
+check("japanese has an elevenlabs voice", has_eleven_voice("japanese"))
+# Scribe transcribes these; the multilingual voice does not speak them, so the
+# reply is shown as text instead of mispronounced.
+check("sinhala has no elevenlabs voice", not has_eleven_voice("sinhala"))
+check("vietnamese has no elevenlabs voice", not has_eleven_voice("vietnamese"))
+
+print("\nreply directive")
+# Naming the script is right for Tamil and Japanese, and actively wrong for
+# Spanish — "do not use Latin letters for Spanish words" can only be obeyed by
+# producing nonsense.
+check("spanish directive names the language",
+      "Spanish" in language_directive("spanish"))
+check("spanish directive does not demand a non-Latin script",
+      "Latin letters" not in language_directive("spanish"))
+check("japanese directive demands the native script",
+      "native Japanese script" in language_directive("japanese"))
+check("tamil directive demands the native script",
+      "native Tamil script" in language_directive("tamil"))
+
+print("\nroute gate — the policy in front of the language-ID model")
+clock = {"t": 1000.0}
+
+
+def gate(**kw):
+    kw.setdefault("min_confidence", 0.55)
+    kw.setdefault("min_audio_s", 0.7)
+    kw.setdefault("sticky_ttl_s", 60)
+    return RouteGate(clock=lambda: clock["t"], **kw)
+
+
+g = gate()
+check("confident spanish routes abroad",
+      g.decide("spanish", 0.9, 3.0) == (ROUTE_INTERNATIONAL, "spanish"))
+check("confident tamil stays local",
+      g.decide("tamil", 0.9, 3.0) == (ROUTE_LOCAL, "tamil"))
+
+# Below the bar the gate declines to commit, and declining means local: a bad
+# local route costs one transcript, a bad international route costs money.
+check("unconfident spanish stays local",
+      gate().decide("spanish", 0.3, 3.0) == (ROUTE_LOCAL, None))
+check("unconfident tamil commits to nothing",
+      gate().decide("tamil", 0.3, 3.0) == (ROUTE_LOCAL, None))
+
+# A fragment is a coin flip however confident the model claims to be.
+check("short utterance stays local however confident",
+      gate().decide("spanish", 0.99, 0.4) == (ROUTE_LOCAL, None))
+check("no prediction stays local",
+      gate().decide(None, 0.99, 3.0) == (ROUTE_LOCAL, None))
+
+print("\nroute gate — hysteresis only ever confirms, never overrules")
+g = gate()
+g.observe("spanish")
+check("shaky spanish is confirmed by the previous turn",
+      g.decide("spanish", 0.3, 3.0) == (ROUTE_INTERNATIONAL, "spanish"))
+# The whole point: switching back to an Indian language must land on the very
+# next sentence, not once the window lapses.
+check("confident tamil wins immediately over sticky spanish",
+      g.decide("tamil", 0.9, 3.0) == (ROUTE_LOCAL, "tamil"))
+check("shaky russian is not confirmed by sticky spanish",
+      g.decide("russian", 0.3, 3.0) == (ROUTE_LOCAL, None))
+
+# A turn that resolved to a local language ends the streak.
+g.observe("tamil")
+check("a local turn closes the window",
+      g.decide("spanish", 0.3, 3.0) == (ROUTE_LOCAL, None))
+
+# But an abstention must not. It is precisely the case the window exists to
+# cover, so closing it there would defeat the whole mechanism on the turns it
+# was built for.
+g = gate()
+g.observe("spanish")
+g.observe(None)
+check("an abstention leaves the window open",
+      g.decide("spanish", 0.3, 3.0) == (ROUTE_INTERNATIONAL, "spanish"))
+
+# A clip too short to classify never reaches the model at all.
+check("short clips are not worth a forward pass",
+      not gate().should_identify(0.4))
+check("long enough clips are", gate().should_identify(1.5))
+
+g = gate()
+g.observe("spanish")
+clock["t"] += 61
+check("the window expires",
+      g.decide("spanish", 0.3, 3.0) == (ROUTE_LOCAL, None))
+
+g = gate(sticky_ttl_s=0)
+g.observe("spanish")
+check("sticky_ttl_s: 0 disables hysteresis",
+      g.decide("spanish", 0.3, 3.0) == (ROUTE_LOCAL, None))
 
 print()
 if failures:
