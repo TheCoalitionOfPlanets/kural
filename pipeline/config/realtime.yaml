@@ -60,13 +60,30 @@ stt:
   lid:
     enabled: true
     model_dir: stt/models/mms-lid-126
-    dtype: float32         # float16 halves the ~1.2GB if VRAM is tight
+    # mms-lid-126 is a 966M-parameter wav2vec2 — bigger than the ASR it gates
+    # for, and it only ever picks a language. float32 costs 3.69 GB, float16
+    # costs 1.86 GB, and the predictions are the same to three decimals on
+    # every case tested (clean English, Tamil, Gujarati, a 1.8s fragment, a
+    # borderline Hindi/English code-mix, and noise). Nothing here needs the
+    # extra precision: the output is an argmax and a probability sum.
+    dtype: float16
     # Below this the prediction is not trusted and the turn stays local.
     # Failing toward local is deliberate: a wrong local route costs one bad
     # transcript, a wrong international route costs an API call — and on a
     # mostly-Indic pipeline the ambiguous turns are mostly Indic. Raise it to
     # spend less; lower it if international speech is being missed.
     min_confidence: 0.55
+    # The main defence against English being sent abroad. Only 15 of MMS-LID's
+    # 126 labels are local, so the top-1 label is structurally biased toward
+    # leaving: English that splits its mass across `eng`, `cym` and `nno` can
+    # top out on a foreign label while local is still right by a wide margin.
+    # This sums the probability over *all* local labels and keeps the turn home
+    # when that total clears the bar, whatever the argmax said.
+    #
+    # Well below half on purpose — the question is not "is this certainly a
+    # local language" but "is there real reason to spend an API call". Raise it
+    # if foreign speech is being kept local; lower it if English still leaves.
+    min_local_mass: 0.30
     # LID on a fragment is a coin flip, and short turns ("yes", "mm", "wait")
     # are overwhelmingly in the language already being spoken.
     min_audio_s: 0.7
@@ -115,7 +132,26 @@ tts:
   device: cuda:0
   require_cuda: true
   model_dir: tts/models/Indic-Mio
+  # MUST be the codec Indic-Mio was trained with — its model card names
+  # MioCodec-25Hz-24kHz. The audio tokens index this codec's codebook, so
+  # decoding them with the 44.1kHz codec does not fail, it just produces
+  # fluent, correctly-timed, completely wrong speech that sounds like the
+  # assistant answering in another language.
   codec_dir: tts/models/MioCodec-25Hz-24kHz
+  # -- the voice ----------------------------------------------------------
+  # Indic-Mio clones zero-shot from a reference clip. Without one it invents a
+  # speaker per utterance at temperature 0.9, so every reply sounds like a
+  # different person. This clip is encoded once at startup and conditions every
+  # synthesis, which is what pins the assistant to a single voice.
+  #
+  # Must be 16-bit mono WAV. A few seconds of clean, neutral speech is enough;
+  # emotion-tagged or whispered audio is cloned faithfully, tone included, so
+  # the reference should sound the way the assistant should sound.
+  #
+  # This is also the file to upload to ElevenLabs Instant Voice Cloning — the
+  # same reference on both stacks is what keeps the local and international
+  # voices recognizably the same speaker. See docs/voice.md.
+  reference_wav: tts/voice/reference.wav
   # Generation knobs, straight from the model card. Every extra token here is
   # also more synthesis latency, same as the LLM's max_new_tokens.
   max_new_tokens: 1024
@@ -211,6 +247,24 @@ echo:
   # containment discards, and bleed arrives as a contiguous fragment of a reply.
   # Lower = more aggressive; below ~4 real speech starts matching by chance.
   ngram: 5
+  # Layer 6: the same *input* arriving twice. Distinct from everything above,
+  # which watches for the assistant's replies coming back. This catches a user
+  # turn the pipeline already accepted being fed in again, which no reply
+  # window can see — the text never was a reply.
+  input:
+    guard: true
+    # Word-level similarity over both texts, not the containment fraction used
+    # above: a re-fed input is the whole utterance again, differing only by STT
+    # jitter, where reply bleed is a short fragment of something long. Lower =
+    # more aggressive; below ~0.8 a user rephrasing the same request starts
+    # being suppressed.
+    threshold: 0.85
+    window: 4              # recent accepted turns compared against
+    # Deliberately shorter than the reply ttl_s above. A repeat is only echo
+    # while the original turn is still in flight; past that, someone saying
+    # "yes please" twice is a person saying it twice, and suppressing it leaves
+    # them unable to repeat a request that was mis-heard.
+    ttl_s: 20
 
 playback:
   device: default

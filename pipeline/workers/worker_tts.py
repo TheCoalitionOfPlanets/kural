@@ -69,9 +69,31 @@ SUPPORTED_LANGS = frozenset({
 SPEECH_OFFSET = 151669
 SPEECH_RANGE = 12800
 
-# Fixed by the model/codec pairing (Aratako/MioCodec-25Hz-24kHz decodes to
-# 44.1kHz), not a per-voice property to read off a config like Piper's.
-SAMPLE_RATE = 44100
+# Fallback only. The real rate comes from the codec's own config at load time
+# (`_codec_sample_rate`), because the two MioCodec checkpoints differ: the
+# wave-decoder one emits 24kHz, the mel one 44.1kHz.
+SAMPLE_RATE = 24000
+
+
+def _codec_sample_rate(config_path, default):
+    """The codec's output rate, read from its own config.
+
+    A tiny scan rather than a yaml import: this worker's venv is not guaranteed
+    to have pyyaml, and only one scalar is needed. The first `sample_rate:` in
+    the file is the codec's, and getting it wrong plays every reply at the
+    wrong speed.
+    """
+    try:
+        with open(config_path, encoding="utf-8") as fh:
+            for line in fh:
+                stripped = line.strip()
+                if stripped.startswith("sample_rate:"):
+                    value = stripped.split(":", 1)[1].split("#")[0].strip()
+                    if value:
+                        return int(value)
+    except (OSError, ValueError):
+        pass
+    return default
 
 
 def emit(obj):
@@ -91,6 +113,7 @@ def main():
     init = json.loads(line)
     cfg = init["config"]
 
+    import numpy as np
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -100,7 +123,8 @@ def main():
         return
 
     try:
-        from miocodec import MioCodec
+        from miocodec import MioCodec  # noqa: F401  (kept for the error message)
+        from miocodec.model import MioCodecModel
     except ImportError:
         log("miocodec is not installed in this venv. Install it with:")
         log(r"  tts\venv\Scripts\python.exe -m pip install "
@@ -115,14 +139,99 @@ def main():
         cfg["model_dir"], dtype=torch.bfloat16, device_map=device,
     )
     model.eval()
-    codec = MioCodec.from_pretrained(cfg["codec_dir"])
+    # Indic-Mio's audio tokens are codec-specific: they index *this* codec's
+    # quantizer codebook and mean nothing to another one. The model card names
+    # MioCodec-25Hz-24kHz, so that is the only checkpoint whose decoder turns
+    # them back into the words that were asked for. Decoding them with the
+    # 44.1kHz codec does not fail — it produces fluent, correctly-timed,
+    # completely wrong speech, which sounds like the model answering in some
+    # other language.
+    #
+    # The two checkpoints are different architectures, not two sizes of one:
+    #
+    #   25Hz-24kHz     wave decoder + iSTFT head -> waveform directly.
+    #                  `mel_decoder: null`, and no vocoder weights, because it
+    #                  does not need one.
+    #   25Hz-44.1kHz   mel decoder + a bundled `vocoder.`-prefixed vocoder.
+    #
+    # `MioCodec.from_pretrained` only knows the second shape and rejects the
+    # first for having "no vocoder weights". So the wave-decoder checkpoint is
+    # loaded through MioCodecModel directly, whose `decode()` returns a
+    # waveform when the config sets `use_wave_decoder`.
+    codec_dir = cfg["codec_dir"]
+    codec_config = os.path.join(codec_dir, "config.yaml")
+    codec_weights = os.path.join(codec_dir, "model.safetensors")
+    vocoder_config = os.path.join(codec_dir, "vocoder_config.json")
+
+    from safetensors.torch import load_file as _load_safetensors
+
+    _state = _load_safetensors(codec_weights, device="cpu")
+    uses_vocoder = any(k.startswith("vocoder.") for k in _state)
+    if uses_vocoder:
+        codec = MioCodec.from_pretrained(
+            config_path=codec_config,
+            weights_path=codec_weights,
+            vocoder_config_path=(vocoder_config
+                                 if os.path.isfile(vocoder_config) else None),
+        )
+        codec_model = codec.model
+        log(f"codec {os.path.basename(codec_dir)}: mel decoder + vocoder")
+    else:
+        codec = None
+        codec_model = MioCodecModel.from_hparams(codec_config)
+        # strict=False: the SSL feature extractor is an *encoder*-side module
+        # and is simply absent from this checkpoint. Nothing on the synthesis
+        # path reads it, so its absence is expected rather than a partial load.
+        codec_model.load_state_dict(_state, strict=False)
+        codec_model = codec_model.to(device).eval()
+        log(f"codec {os.path.basename(codec_dir)}: wave decoder (no vocoder)")
+    del _state
+
+    # The codec's own rate, not a constant: the wave-decoder checkpoint emits
+    # 24kHz and the mel one 44.1kHz, and writing the wrong number into the WAV
+    # header plays the reply at the wrong speed and pitch.
+    sample_rate = _codec_sample_rate(codec_config, SAMPLE_RATE)
+
+    # -- the voice ---------------------------------------------------------
+    # Indic-Mio is zero-shot: with no reference speaker it invents one per
+    # utterance, sampled at temperature 0.9, so consecutive replies come back
+    # in different voices. The reference WAV below is encoded once at startup
+    # and conditions every synthesis, which is what makes the assistant sound
+    # like one person.
+    reference_wav = cfg.get("reference_wav")
+    reference = None
+    speaker = None
+    if reference_wav and os.path.isfile(reference_wav):
+        with wave.open(reference_wav, "rb") as fh:
+            if fh.getsampwidth() != 2 or fh.getnchannels() != 1:
+                log(f"reference_wav must be 16-bit mono; {reference_wav} is "
+                    f"{fh.getsampwidth() * 8}-bit {fh.getnchannels()}ch — ignoring")
+            else:
+                raw = fh.readframes(fh.getnframes())
+                ref_rate = fh.getframerate()
+                samples = np.frombuffer(raw, dtype="<i2").astype("float32") / 32768.0
+                if ref_rate != sample_rate:
+                    # The codec encodes at its own rate; a reference at another
+                    # rate yields a speaker embedding for a voice pitched wrong.
+                    idx = (np.arange(int(len(samples) * sample_rate / ref_rate))
+                           * ref_rate / sample_rate).astype(int)
+                    samples = samples[idx[idx < len(samples)]]
+                reference = torch.from_numpy(samples).unsqueeze(0).to(device)
+                # Encoded once here rather than per utterance: the embedding is
+                # a property of the clip, and re-deriving it every reply would
+                # pay for the same forward pass on every turn.
+                speaker = codec_model.encode(
+                    reference, return_content=False, return_global=True
+                ).global_embedding
+    elif reference_wav:
+        log(f"reference_wav {reference_wav!r} not found; the local voice will "
+            f"vary between utterances")
+
     load_s = time.time() - t0
 
     max_new_tokens = int(cfg.get("max_new_tokens", 1024))
     temperature = float(cfg.get("temperature", 0.9))
     top_p = float(cfg.get("top_p", 0.9))
-
-    import numpy as np
 
     # Echo reduction layer 1: the feedback loop is acoustic, so the most
     # effective software lever is amplitude. Quieter output that the user
@@ -177,12 +286,28 @@ def main():
             if SPEECH_OFFSET <= t.item() < SPEECH_OFFSET + SPEECH_RANGE
         ]
         if not audio_codes:
-            return np.zeros(0, dtype=np.float32), SAMPLE_RATE
+            return np.zeros(0, dtype=np.float32), sample_rate
 
-        codes_tensor = torch.tensor([audio_codes], dtype=torch.long).unsqueeze(0)
-        wav = codec.decode(codes_tensor)
-        audio = wav.squeeze().to(torch.float32).cpu().numpy()
-        return audio, SAMPLE_RATE
+        codes_tensor = torch.tensor(audio_codes, dtype=torch.long, device=device)
+        if speaker is None:
+            # Without a reference there is no speaker embedding, and the codec
+            # requires one — there is no "just decode the content" path. Say so
+            # plainly rather than raising from inside the codec.
+            raise RuntimeError(
+                "no reference voice: set tts.reference_wav (see docs/voice.md)"
+            )
+        # Content tokens carry *what* was said; the speaker embedding supplies
+        # who says it. Both codec shapes take the same two arguments here — the
+        # wave decoder returns a waveform, the mel decoder a spectrogram that
+        # still needs the vocoder run over it.
+        out = codec_model.decode(
+            global_embedding=speaker, content_token_indices=codes_tensor,
+        )
+        if codec is not None:
+            from miocodec.util import vocode
+            out = vocode(codec.vocoder, out.unsqueeze(0)).squeeze(0)
+        audio = out.squeeze().to(torch.float32).cpu().numpy()
+        return audio, sample_rate
 
     # -- the international voice -------------------------------------------
     el_cfg = cfg.get("elevenlabs") or {}
@@ -216,8 +341,11 @@ def main():
     emit({
         "event": "ready",
         "load_s": round(load_s, 2),
-        "sample_rate": SAMPLE_RATE,
+        "sample_rate": sample_rate,
         "languages": sorted(SUPPORTED_LANGS),
+        # False means the local voice is re-invented every utterance, which
+        # sounds like a bug long before anyone suspects the config.
+        "reference_voice": reference is not None,
         "elevenlabs": client is not None,
         "vram_gb": round(torch.cuda.memory_allocated() / 1024**3, 2),
     })
@@ -239,7 +367,11 @@ def main():
         # audio took. They usually agree, but when they do not the reply is
         # what is about to be spoken — so a turn misrouted to Scribe and then
         # correctly identified as Tamil still comes back in the local voice.
-        route = route_for(lang)
+        # stage="tts" because this is the *voice* decision, and Indic-Mio
+        # speaks two languages SraVaani cannot hear (Urdu, Kashmiri). Asking
+        # the combined set would send an Urdu reply to ElevenLabs even though
+        # the local voice handles it.
+        route = route_for(lang, stage="tts")
         backend = "elevenlabs" if route == ROUTE_INTERNATIONAL else "indic-mio"
         try:
             # Same gap, two voices: a language neither backend speaks is

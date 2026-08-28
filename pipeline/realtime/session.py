@@ -19,7 +19,7 @@ import queue
 import threading
 
 from .capture import CaptureThread
-from .echo_guard import RecentSpeech
+from .echo_guard import RecentInput, RecentSpeech
 from .interrupt import InterruptController
 from .proc import WorkerProcess
 from .workers import LLMStage, PlaybackStage, STTStage, TTSStage
@@ -139,6 +139,16 @@ class Session:
             ttl_s=float(echo_cfg.get("ttl_s", 30)),
             ngram=int(echo_cfg.get("ngram", 5)),
         ) if echo_cfg.get("guard", True) else None
+        # The other loop: the same *input* re-entering the pipeline. Separate
+        # from the reply window because it holds user turns, not replies, and
+        # expires on the shorter clock of a turn in flight rather than the
+        # longer one of audible playback.
+        input_cfg = echo_cfg.get("input", {})
+        self.recent_input = RecentInput(
+            input_cfg.get("window", 4),
+            ttl_s=float(input_cfg.get("ttl_s", 20)),
+            threshold=float(input_cfg.get("threshold", 0.85)),
+        ) if input_cfg.get("guard", True) else None
         self.echo_threshold = float(echo_cfg.get("threshold", 0.6))
         self.mute_tail_s = float(echo_cfg.get("mute_tail_ms", 0)) / 1000.0
         self.keep_wavs = bool(cfg.get("playback", {}).get("keep_wavs", False))
@@ -225,7 +235,8 @@ class Session:
                      self.stop_event, self.on_event,
                      recent_speech=self.recent_speech,
                      echo_threshold=self.echo_threshold, on_echo=on_echo,
-                     interrupt=self.interrupt, on_flush=self._flush_downstream),
+                     interrupt=self.interrupt, on_flush=self._flush_downstream,
+                     recent_input=self.recent_input),
             LLMStage(llm, self.transcript_q, self.reply_q, self.stop_event,
                      self.on_event, recent_speech=self.recent_speech),
             TTSStage(tts, self.spill_dir, self.reply_q, self.wav_q,

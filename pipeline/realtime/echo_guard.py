@@ -12,6 +12,12 @@ odds: if the mic heard "I can help with that" while the assistant was saying
 It is not a human-vs-bot classifier. The same sentence is valid from either
 speaker — the only signal is overlap with what the assistant is currently
 saying.
+
+Two loops are caught here, by two separate windows. `RecentSpeech` catches the
+assistant hearing its own *reply*. `RecentInput` catches the same *input*
+arriving twice — the machine re-feeding a user turn it has already accepted.
+The reply window cannot catch that one: the text never was a reply, so nothing
+in it matches.
 """
 import re
 import threading
@@ -182,6 +188,153 @@ class RecentSpeech:
 
     def is_echo(self, transcript, threshold=0.6):
         return is_echo_of(transcript, self.snapshot(), threshold, self._ngram)
+
+    def __len__(self):
+        return len(self.snapshot())
+
+
+# --- Input-side echo ------------------------------------------------------
+#
+# `RecentSpeech` above catches the assistant hearing its *own reply*. It cannot
+# catch the other loop: the machine re-feeding a *user turn* back into the
+# pipeline, so the same input is transcribed and answered twice. Nothing in the
+# reply window matches, because the text never was a reply — it was an input.
+#
+# The signal is different too. Reply bleed arrives as a short fragment of a long
+# utterance, so containment is asymmetric and a fragment run is the giveaway. A
+# re-fed input is the *whole* utterance again, near-identical end to end, with
+# only STT jitter between the two passes. That makes it a symmetric similarity
+# question, which is why this uses a ratio over both texts rather than the
+# containment score above.
+
+# A re-fed input is the same utterance transcribed twice, so the only differences
+# are STT jitter — a dropped filler, a different homophone. Below this the two
+# texts differ by more than re-transcription explains and it is a person
+# genuinely repeating themselves, whose turn must go through.
+INPUT_ECHO_THRESHOLD = 0.85
+
+# Repeats are only echo while the earlier turn is still moving through the
+# pipeline. Past that, "yes please" said twice is a person saying it twice, and
+# suppressing it strands them mid-conversation with no way to repeat a request
+# the system mis-heard.
+INPUT_TTL_S = 20.0
+
+# Below this, whole short turns ("yes", "stop", "no thanks") are legitimately
+# repeated verbatim and would be suppressed on every second use. Short turns are
+# also where suppression hurts most, since they are how a user corrects course.
+MIN_INPUT_ECHO_WORDS = 2
+
+
+def _similarity(a_words, b_words):
+    """Symmetric word-level similarity in [0, 1].
+
+    A multiset (not set) intersection over the mean length, so a duplicated word
+    only counts as often as both sides actually contain it, and so a short text
+    cannot score high merely by being a subset of a long one — the asymmetry
+    that makes containment the right call for reply bleed and the wrong one
+    here.
+    """
+    if not a_words or not b_words:
+        return 0.0
+
+    counts = {}
+    for w in a_words:
+        counts[w] = counts.get(w, 0) + 1
+
+    shared = 0
+    for w in b_words:
+        if counts.get(w, 0) > 0:
+            counts[w] -= 1
+            shared += 1
+
+    return 2.0 * shared / (len(a_words) + len(b_words))
+
+
+def is_input_echo_of(transcript, previous, threshold=INPUT_ECHO_THRESHOLD):
+    """True when `transcript` is a re-feed of an earlier *input*.
+
+    Compared against each earlier input separately, for the same reason
+    `is_echo_of` does: pooling several turns into one bag of words inflates the
+    vocabulary until an unrelated turn clears the threshold on common words.
+
+    `previous` may be a single string or an iterable of recent inputs.
+    """
+    words = _norm(transcript)
+    if len(words) < MIN_INPUT_ECHO_WORDS:
+        return False
+
+    if isinstance(previous, str):
+        previous = [previous]
+
+    for earlier in previous:
+        earlier_words = _norm(earlier)
+        if not earlier_words:
+            continue
+        if _similarity(words, earlier_words) >= threshold:
+            return True
+
+    return False
+
+
+class RecentInput:
+    """Thread-safe cache of recent user turns, to catch re-fed input.
+
+    Deliberately separate from `RecentSpeech` rather than another window on the
+    same object: the two hold different kinds of text, are compared with
+    different scorers, and expire on different clocks. A reply stays relevant as
+    long as it is audible; an input only as long as its own turn is in flight.
+    """
+
+    def __init__(self, maxlen=4, ttl_s=INPUT_TTL_S,
+                 threshold=INPUT_ECHO_THRESHOLD):
+        self._items = []          # list of (monotonic_ts, text)
+        self._maxlen = int(maxlen)
+        self._ttl_s = float(ttl_s)
+        self._threshold = float(threshold)
+        self._lock = threading.Lock()
+
+    def _prune(self, now):
+        if self._ttl_s > 0:
+            cutoff = now - self._ttl_s
+            self._items = [it for it in self._items if it[0] >= cutoff]
+        del self._items[: -self._maxlen]
+
+    def add(self, text):
+        """Record a transcript that was accepted as a real user turn.
+
+        Only accepted turns are recorded. Recording suppressed ones too would
+        keep refreshing the timestamp of whatever is being re-fed, so a single
+        stuck repeat could hold its own entry alive indefinitely and outlast the
+        TTL that is supposed to release it.
+        """
+        text = (text or "").strip()
+        if not text:
+            return
+        now = time.monotonic()
+        with self._lock:
+            for i, (_ts, existing) in enumerate(self._items):
+                if existing == text:
+                    self._items[i] = (now, existing)
+                    break
+            else:
+                self._items.append((now, text))
+            self._prune(now)
+
+    def snapshot(self):
+        now = time.monotonic()
+        with self._lock:
+            self._prune(now)
+            return [text for _ts, text in self._items]
+
+    def clear(self):
+        with self._lock:
+            self._items.clear()
+
+    def is_echo(self, transcript, threshold=None):
+        return is_input_echo_of(
+            transcript, self.snapshot(),
+            self._threshold if threshold is None else threshold,
+        )
 
     def __len__(self):
         return len(self.snapshot())

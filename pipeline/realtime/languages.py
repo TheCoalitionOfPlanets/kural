@@ -15,11 +15,17 @@ Two detection paths, because STT output arrives two ways:
   a speaker cannot avoid using.
 
 This module is also where the **stack routing** decision lives. The local
-models are Indic by construction — SraVaani hears the scheduled Indian
-languages plus English, Indic-Mio speaks the same set — so a language outside
-that set has neither a local ear nor a local voice, and is served by ElevenLabs
-instead. `route_for()` is the one place that decision is made; STT, the LLM and
-TTS all consult it rather than each keeping their own list.
+models are Indic by construction — SraVaani hears Indian languages plus
+English, Indic-Mio speaks the 22 scheduled languages plus English — so a
+language outside that range has neither a local ear nor a local voice, and is
+served by ElevenLabs instead. `route_for()` is the one place that decision is
+made; STT, the LLM and TTS all consult it rather than each keeping their own
+list.
+
+The two local sets are *not* identical, which is why `route_for()` takes a
+`stage`. SraVaani's model card excludes Urdu and Kashmiri; Indic-Mio speaks
+both. So an Urdu turn is heard by Scribe and spoken by the local voice — each
+stage using whichever model can actually do its half.
 
 Imported by workers running in three different venvs, so it stays stdlib-only.
 """
@@ -167,18 +173,37 @@ SUPPORTED = frozenset({ENGLISH} | set(_ROMANIZED) | {n for n, _, _ in _SCRIPT_RA
 ROUTE_LOCAL = "local"
 ROUTE_INTERNATIONAL = "international"
 
-LOCAL = frozenset({
+# Indic-Mio's own language list (model-card frontmatter): English plus all 22
+# scheduled Indian languages, spoken from one set of weights. The script
+# detector cannot separate most of these — every Devanagari language reads as
+# "hindi" — but audio-level LID names them directly, so they have to be
+# recognized here or a Marathi turn would be routed abroad.
+LOCAL_TTS = frozenset({
     ENGLISH,
-    # Indic-Mio's own language list (model-card frontmatter), which is also
-    # SraVaani's. The script detector cannot separate most of these — every
-    # Devanagari language reads as "hindi" — but audio-level LID names them
-    # directly, so they have to be recognized here or a Marathi turn would be
-    # routed abroad.
     "hindi", "bengali", "marathi", "telugu", "kannada", "tamil", "malayalam",
     "gujarati", "punjabi", "odia", "urdu", "nepali", "assamese", "sanskrit",
     "konkani", "maithili", "dogri", "bodo", "santali", "sindhi", "manipuri",
     "kashmiri",
 })
+
+# What SraVaani can actually *hear*, which is not the same set — the two models
+# were trained by different people for different tasks, and assuming they match
+# is how Urdu ends up being transcribed by a model that has never seen it.
+#
+# SraVaani covers 65 Indian languages and dialects plus English, but its model
+# card is explicit: "Urdu and Kashmiri are not supported in this release."
+# Neither appears in its evaluation tables. So both are removed from the STT
+# side while staying on the TTS side, which speaks them fine.
+#
+# The practical effect is that an Urdu turn is *heard* by Scribe and *spoken*
+# by Indic-Mio — each stage independently using whichever model can do the job.
+LOCAL_STT = LOCAL_TTS - {"urdu", "kashmiri"}
+
+# The languages both halves of the local stack handle. This is what `route_for`
+# answers on, since a turn is only fully local when it can be both heard and
+# spoken here; the per-stage sets above are for the stages that need finer
+# detail than that.
+LOCAL = LOCAL_STT & LOCAL_TTS
 
 # What ElevenLabs' multilingual TTS actually speaks. Scribe hears far more
 # languages than this, so a turn can be transcribed perfectly and still have no
@@ -255,6 +280,40 @@ _LATIN_SCRIPT = frozenset({
     "vietnamese", "hungarian", "norwegian", "swahili", "afrikaans",
 })
 
+# Which writing system each language uses. Coarser than the language itself and
+# deliberately so: it answers "could these two names describe the same text?",
+# which is what is needed to tell a *plausible* disagreement from an impossible
+# one. Hindi vs Marathi share Devanagari and cannot be told apart by script, so
+# that disagreement is left alone; Korean vs English cannot possibly be the same
+# text, so that one is a detection error worth correcting.
+_SCRIPTS = {name: "latin" for name in _LATIN_SCRIPT}
+_SCRIPTS.update({
+    "hindi": "devanagari", "marathi": "devanagari", "sanskrit": "devanagari",
+    "nepali": "devanagari", "konkani": "devanagari", "maithili": "devanagari",
+    "dogri": "devanagari", "bodo": "devanagari",
+    "bengali": "bengali", "assamese": "bengali",
+    "tamil": "tamil", "telugu": "telugu", "kannada": "kannada",
+    "malayalam": "malayalam", "gujarati": "gujarati", "odia": "odia",
+    "punjabi": "punjabi", "santali": "olchiki", "manipuri": "meitei",
+    "urdu": "perso-arabic", "kashmiri": "perso-arabic",
+    "sindhi": "perso-arabic", "arabic": "perso-arabic", "persian": "perso-arabic",
+    "russian": "cyrillic", "ukrainian": "cyrillic", "bulgarian": "cyrillic",
+    "greek": "greek", "hebrew": "hebrew", "thai": "thai",
+    "korean": "hangul", "japanese": "japanese", "chinese": "han",
+    "sinhala": "sinhala",
+})
+
+
+def script_of(lang):
+    """The writing system a language uses, or None if unknown.
+
+    Two languages sharing a script can be confused by any text-based detector
+    and that confusion is not evidence of anything. Two languages in different
+    scripts cannot describe the same string, so a disagreement there is a real
+    error.
+    """
+    return _SCRIPTS.get(str(lang or "").strip().lower())
+
 
 def language_from_code(code):
     """ISO 639-1/639-3 -> this pipeline's language name.
@@ -277,8 +336,15 @@ def language_from_code(code):
     return key or None
 
 
-def route_for(lang):
+def route_for(lang, stage=None):
     """Which stack should handle this language.
+
+    `stage` names which half of the local stack is asking: "stt" for the ear,
+    "tts" for the voice, None for "both must work". The distinction exists
+    because the two local models do not cover the same languages — SraVaani
+    cannot hear Urdu or Kashmiri, Indic-Mio speaks both — so a single answer
+    would either send Urdu to an ear that cannot hear it or send its reply to
+    ElevenLabs when a local voice was available.
 
     The default is local: a turn whose language was never established is
     overwhelmingly English or Indic here, and guessing local costs a bad
@@ -287,7 +353,8 @@ def route_for(lang):
     """
     if not lang:
         return ROUTE_LOCAL
-    return ROUTE_LOCAL if str(lang).strip().lower() in LOCAL \
+    handled = {"stt": LOCAL_STT, "tts": LOCAL_TTS}.get(stage, LOCAL)
+    return ROUTE_LOCAL if str(lang).strip().lower() in handled \
         else ROUTE_INTERNATIONAL
 
 
@@ -315,10 +382,17 @@ class RouteGate:
     """
 
     def __init__(self, min_confidence=0.55, min_audio_s=0.7, sticky_ttl_s=60.0,
-                 clock=time.time):
+                 min_local_mass=0.30, clock=time.time):
         self.min_confidence = float(min_confidence)
         self.min_audio_s = float(min_audio_s)
         self.sticky_ttl_s = float(sticky_ttl_s)
+        # Deliberately well below half. The question is not "is this definitely
+        # a local language" but "is there real reason to spend an API call", and
+        # 111 of 126 labels vote to leave — so a third of the mass staying home
+        # is already strong evidence against a foreign turn. English and Indic
+        # speech that LID is merely unsure about clears this comfortably; actual
+        # Spanish or Chinese does not come close.
+        self.min_local_mass = float(min_local_mass)
         self._clock = clock
         self._sticky = None
         self._sticky_at = 0.0
@@ -342,15 +416,31 @@ class RouteGate:
         """
         return duration_s >= self.min_audio_s
 
-    def decide(self, lang, confidence, duration_s):
+    def decide(self, lang, confidence, duration_s, local_mass=None):
         """(route, language) for one utterance.
 
         The language is None whenever the gate declined to commit, which puts
         everything downstream back on transcript-based detection — the
         behaviour from before any of this existed.
+
+        `local_mass` is the share of LID's probability sitting on languages the
+        local stack can hear, and it is the decision that matters most here.
+        Only 15 of MMS-LID's 126 labels are local, so the top-1 label is biased
+        toward leaving: an English utterance that splits its mass across `eng`,
+        `cym` and `nno` can top out on a foreign label and be sent abroad even
+        though local was the right answer by a wide margin. Summing per route
+        instead of trusting the argmax is what stops one confident-looking
+        wrong label from spending an API call on English.
         """
         if not lang or not self.should_identify(duration_s):
             return ROUTE_LOCAL, None
+
+        # Routing is a binary question, so answer it with the binary evidence
+        # when it exists. A turn only leaves when the *international* mass
+        # actually outweighs the local — never because one foreign label
+        # happened to win a 126-way vote.
+        if local_mass is not None and local_mass >= self.min_local_mass:
+            return ROUTE_LOCAL, lang if route_for(lang, stage="stt") == ROUTE_LOCAL else None
 
         confident = confidence >= self.min_confidence
         # Hysteresis, and only in this direction: it can confirm a shaky
@@ -362,7 +452,9 @@ class RouteGate:
             confident = True
         if not confident:
             return ROUTE_LOCAL, None
-        return route_for(lang), lang
+        # The gate rules on the *ear*: it is choosing which model transcribes
+        # this audio. The voice is chosen separately, from the reply's language.
+        return route_for(lang, stage="stt"), lang
 
     def observe(self, lang):
         """Record what the turn actually turned out to be.

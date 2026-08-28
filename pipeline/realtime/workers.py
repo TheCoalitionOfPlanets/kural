@@ -58,11 +58,12 @@ class STTStage(_Stage):
 
     def __init__(self, worker, spill_dir, *args, recent_speech=None,
                  echo_threshold=0.6, on_echo=None, interrupt=None,
-                 on_flush=None):
+                 on_flush=None, recent_input=None):
         super().__init__("stt", *args)
         self.worker = worker
         self.spill_dir = Path(spill_dir)
         self.recent_speech = recent_speech
+        self.recent_input = recent_input
         self.echo_threshold = echo_threshold
         self.on_echo = on_echo or (lambda *a, **k: None)
         self.interrupt = interrupt
@@ -148,6 +149,28 @@ class STTStage(_Stage):
                 # treated as a user turn.
                 self._resolve(utt, "reject", "echo")
                 continue
+
+            # Layer 6: the same input arriving twice — a turn already accepted
+            # being re-fed rather than a reply bleeding back. Checked after the
+            # reply guard because the two are independent: an utterance can be
+            # neither, either, or both, and the reason reported should be the
+            # one that actually fired.
+            if self.recent_input is not None and self.recent_input.is_echo(text):
+                self.on_event("input_echo_dropped", utt_id=utt.utt_id,
+                              text=text,
+                              barge_in=getattr(utt, "barge_in", False))
+                self.on_echo(utt.utt_id, text)
+                # Same reasoning as the reply case: the audio is already gone,
+                # and this only keeps the re-feed from becoming a second turn.
+                self._resolve(utt, "reject", "input_echo")
+                continue
+
+            # Accepted as a real turn, so it becomes the thing later utterances
+            # are compared against. Recorded here rather than downstream: the
+            # re-feed can arrive before the LLM has finished answering the
+            # original, and an unrecorded turn is one the guard cannot catch.
+            if self.recent_input is not None:
+                self.recent_input.add(text)
 
             # Real user speech over the assistant. The interrupt stands.
             self._resolve(utt, "confirm")

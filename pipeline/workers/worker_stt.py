@@ -41,8 +41,10 @@ from realtime.languages import (  # noqa: E402
     ROUTE_INTERNATIONAL,
     ROUTE_LOCAL,
     RouteGate,
+    detect_language,
     language_from_code,
     route_for,
+    script_of,
 )
 
 # MMS-LID was trained on 16kHz speech, which is also SraVaani's rate and the
@@ -128,6 +130,7 @@ def main():
         min_confidence=lid_cfg.get("min_confidence", 0.55),
         min_audio_s=lid_cfg.get("min_audio_s", 0.7),
         sticky_ttl_s=lid_cfg.get("sticky_ttl_s", 60),
+        min_local_mass=lid_cfg.get("min_local_mass", 0.30),
     )
     # LID needs a few seconds, not the whole turn; capping bounds the forward
     # pass so a 15s utterance costs the same as a 3s one.
@@ -153,10 +156,30 @@ def main():
             log(f"ElevenLabs speech-to-text unavailable ({exc}); international "
                 f"speech will be reported, not transcribed")
 
+    # Which of MMS-LID's 126 labels the local ear can handle. Built once, from
+    # the model's own label list, so it cannot drift from LOCAL_STT.
+    local_label_ids = None
+
+    def _local_label_ids(lid_model):
+        """Indices of labels that route to the local stack."""
+        ids = [
+            i for i, code in lid_model.config.id2label.items()
+            if route_for(language_from_code(code), stage="stt") == ROUTE_LOCAL
+        ]
+        return torch.tensor(sorted(ids), device=lid_model.device)
+
     def identify(wav):
-        """(language name, ISO-639-3 code, confidence) for this waveform."""
+        """(language, code, confidence, local_mass) for this waveform.
+
+        `local_mass` is the summed probability of every label the local ear
+        handles. It matters more than the top-1 label: only 15 of 126 labels
+        are local, so an English turn whose mass is spread over `eng`, `cym`
+        and `nno` can lose the argmax to a foreign label while local remains
+        the right route by a wide margin.
+        """
+        nonlocal local_label_ids
         if lid is None:
-            return None, None, 0.0
+            return None, None, 0.0, None
         extractor, lid_model, dtype = lid
         clip = wav[:int(max_audio_s * LID_SAMPLE_RATE)]
         inputs = extractor(clip, sampling_rate=LID_SAMPLE_RATE,
@@ -167,9 +190,13 @@ def main():
         with torch.inference_mode():
             logits = lid_model(**inputs).logits
         probs = torch.softmax(logits.float(), dim=-1)[0]
+        if local_label_ids is None:
+            local_label_ids = _local_label_ids(lid_model)
+        local_mass = float(probs[local_label_ids].sum().item())
         idx = int(torch.argmax(probs).item())
         code = lid_model.config.id2label[idx]
-        return language_from_code(code), code, float(probs[idx].item())
+        return (language_from_code(code), code, float(probs[idx].item()),
+                local_mass)
 
     def decide(wav, duration_s):
         """Route this utterance. Returns (route, lang, code, confidence)."""
@@ -177,8 +204,9 @@ def main():
         # discard anyway — every short "mm" would otherwise pay for one.
         if lid is None or not gate.should_identify(duration_s):
             return ROUTE_LOCAL, None, None, 0.0
-        predicted, code, confidence = identify(wav)
-        route, lang = gate.decide(predicted, confidence, duration_s)
+        predicted, code, confidence, local_mass = identify(wav)
+        route, lang = gate.decide(predicted, confidence, duration_s,
+                                  local_mass=local_mass)
         return route, lang, code, confidence
 
     emit({
@@ -237,9 +265,27 @@ def main():
                     wav_bytes,
                     language_code=code if confidence >= hint_confidence else None,
                 )
+                text = result["text"]
                 # Scribe outranks LID: it heard the words, not just the accent.
                 heard = language_from_code(result.get("language_code")) or lang
-                text = result["text"]
+
+                # ...but not the transcript it just produced. Scribe misnames
+                # the language of short or noisy clips — reporting Korean or
+                # Chinese for English speech — and that name is not cosmetic:
+                # it becomes "Reply ONLY in Korean" in the LLM's directive and
+                # a Korean voice at synthesis. The script of the text is the
+                # one piece of evidence that cannot disagree with itself, so
+                # when the two conflict the text wins.
+                written = detect_language(text) if text.strip() else None
+                if written and written != heard:
+                    # Only override when the scripts genuinely differ. Scribe
+                    # saying "hindi" for Marathi is a distinction the script
+                    # cannot make and should not be second-guessed on; Scribe
+                    # saying "korean" over Latin text is.
+                    if script_of(written) != script_of(heard):
+                        log(f"scribe said {heard!r} but the transcript is "
+                            f"{written!r}; trusting the script")
+                        heard = written
                 gate.observe(heard)
                 emit({
                     "ok": True,
@@ -247,7 +293,7 @@ def main():
                     "text": text,
                     "lang": heard,
                     "lang_code": result.get("language_code") or code,
-                    "route": route_for(heard),
+                    "route": route_for(heard, stage="stt"),
                     "backend": "elevenlabs",
                     "confidence": round(
                         float(result.get("probability") or confidence), 3),

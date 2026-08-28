@@ -126,6 +126,20 @@ and the model answers itself. Three layers guard against that:
    assistant just said, it is bleed, not a human, and it never reaches the
    model.
 
+A fourth layer catches a different loop entirely:
+
+4. **Input echo guard** — `echo.input.guard: true`. Everything above watches
+   for the assistant's *replies* coming back. This catches the same *input*
+   arriving twice — a user turn the pipeline already accepted being fed in
+   again — which no reply window can see, because the text never was a reply.
+   Compared by symmetric similarity over both texts rather than the containment
+   fraction the reply guard uses: a re-fed input is the whole utterance again,
+   differing only by STT jitter, where reply bleed is a short fragment of
+   something long. `echo.input.ttl_s` is deliberately shorter than the reply
+   window's, because a repeat is only echo while the original turn is still in
+   flight — past that, someone saying "yes please" twice is a person saying it
+   twice.
+
 The genuinely airtight fix is physical: **headphones**, or a directional mic
 pointed away from the speakers. Everything above is mitigation.
 
@@ -288,6 +302,13 @@ Everything lives in [config/realtime.yaml](config/realtime.yaml).
 
 **Real speech gets swallowed as echo** — raise `echo.threshold` toward `0.75`.
 
+**The same input is answered twice** — confirm `echo.input.guard: true`; lower
+`echo.input.threshold` toward `0.8`.
+
+**A deliberate repeat gets swallowed** — the user said the same thing twice on
+purpose and the second was dropped. Raise `echo.input.threshold` toward `0.95`,
+or lower `echo.input.ttl_s` so a repeat counts as echo for a shorter window.
+
 **False triggers on room noise** — raise `capture.vad.noise_margin` (energy
 gate multiplier over the calibrated floor) or `aggressiveness` (0–3). The
 webrtc backend requires *both* a voiced classification and energy above the
@@ -326,7 +347,7 @@ pipeline/
 │   ├── capture.py         VAD endpointing + pluggable frame sources
 │   ├── proc.py            subprocess model host (JSON-lines protocol)
 │   ├── workers.py         stage threads: STT → LLM → TTS → playback
-│   ├── echo_guard.py      text-level self-hearing detection
+│   ├── echo_guard.py      text-level self-hearing and re-fed-input detection
 │   ├── languages.py       language detection, stack routing, reply directive
 │   ├── elevenlabs.py      stdlib-only HTTP client for the international path
 │   ├── speakable.py       strips what a TTS voice cannot say

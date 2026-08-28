@@ -323,6 +323,7 @@ export class VoiceClient {
 
       case "stt_empty":
       case "echo_dropped":
+      case "input_echo_dropped":
         this.setState("listening");
         return;
 
