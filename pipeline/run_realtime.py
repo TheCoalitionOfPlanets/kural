@@ -20,6 +20,7 @@ and barge-in.
 """
 import argparse
 import queue
+import re
 import signal
 import sys
 import threading
@@ -111,7 +112,6 @@ def main():
 
     console = Console(log_latency=runtime.get("log_latency", True))
     stop_event = threading.Event()
-    eleven_cfg = cfg.get("elevenlabs") or {}
     playback_cfg = cfg.get("playback", {})
 
     # -- status routing ----------------------------------------------------
@@ -179,10 +179,8 @@ def main():
                   f" — every turn routes to the local Indic models", flush=True)
         if info.get("elevenlabs") is False:
             missing = "transcribe" if label == "stt" else "speak"
-            print(f"    ! ElevenLabs off — cannot {missing} languages outside "
-                  f"the local set. Set "
-                  f"${eleven_cfg.get('api_key_env', 'ELEVENLABS_API_KEY')}.",
-                  flush=True)
+            print(f"    ! international {label} off — cannot {missing} "
+                  f"languages outside the local set", flush=True)
 
     def on_stage(kind, **kw):
         utt = kw.get("utt_id", "")
@@ -192,14 +190,14 @@ def main():
             # only visible sign that a paid call was made.
             tag = ""
             if kw.get("backend") == "elevenlabs":
-                tag = f" ({kw.get('lang') or 'international'} via elevenlabs)"
+                tag = f" ({kw.get('lang') or 'international'} via remote)"
             console.line(f"[{utt}] heard{tag}: {kw['text']}")
         elif kind == "llm":
             lang = kw.get("lang")
             tag = f" ({lang})" if lang else ""
             console.line(f"[{utt}] reply{tag}: {kw['text']}")
         elif kind == "tts":
-            tag = " via elevenlabs" if kw.get("backend") == "elevenlabs" else ""
+            tag = " via remote" if kw.get("backend") == "elevenlabs" else ""
             console.line(f"[{utt}] synth {kw.get('audio_s')}s "
                          f"in {kw.get('elapsed_s')}s{tag}")
         elif kind == "latency":
@@ -216,9 +214,7 @@ def main():
             # gibberish, so the turn is dropped and the reason named.
             console.line(
                 f"[{utt}] ! {kw.get('lang') or 'international'} speech, but "
-                f"ElevenLabs is not configured — turn dropped. Set "
-                f"${cfg.get('elevenlabs', {}).get('api_key_env', 'ELEVENLABS_API_KEY')}"
-                f" and restart."
+                f"the international path is not configured — turn dropped."
             )
         elif kind == "echo_dropped":
             console.line(f"[{utt}] echo of own output, dropped: {kw['text']}")
@@ -249,8 +245,24 @@ def main():
         elif kind.endswith("_failed") or kind == "stage_error":
             console.line(f"  ! {kind}: {kw.get('error')}")
 
+    # Worker stderr is forwarded verbatim, so anything the vendor SDK, an HTTP
+    # error or a traceback happens to say reaches the terminal unedited — the
+    # API host, the exception class, the module path. The console names
+    # capabilities ("international speech-to-text"), never the provider, so
+    # this is the one choke point where that guarantee can actually be kept:
+    # every child line passes through here on its way to the screen.
+    _VENDOR_RE = re.compile(
+        r"api\.elevenlabs\.io|elevenlabs\.io|ElevenLabsError|ElevenLabs|"
+        r"eleven_multilingual\w*|eleven_\w+|elevenlabs|ELEVENLABS\w*",
+        re.IGNORECASE,
+    )
+
+    def _scrub(text):
+        """Replace any mention of the international provider with its role."""
+        return _VENDOR_RE.sub("international-tts-provider", text)
+
     def on_worker_log(name, line):
-        console.line(f"  [{name}] {line}")
+        console.line(f"  [{name}] {_scrub(line)}")
 
     # -- capture-only mode (build order step 1) ----------------------------
 

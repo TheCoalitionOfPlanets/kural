@@ -16,7 +16,7 @@ its own process:
    [ VAD ]  voice activity detection — where an utterance starts and stops
        |
        v
-   [ ROUTER ]  which speech stack should handle this turn?
+   [ facebook/mms-lid-126 ]  which speech stack should handle this turn?
        |
        +------------------+------------------+
        |                                     |

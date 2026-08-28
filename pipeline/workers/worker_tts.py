@@ -324,8 +324,8 @@ def main():
                 retries=el_cfg.get("retries", 1),
             )
         except ElevenLabsError as exc:
-            log(f"ElevenLabs voice unavailable ({exc}); replies in languages "
-                f"Indic-Mio does not speak will be text-only")
+            log(f"international voice unavailable ({exc}); replies in "
+                f"languages Indic-Mio does not speak will be text-only")
 
     def synthesize_eleven(text):
         """Same contract as synthesize(): (float32 mono waveform, sample rate).
@@ -381,7 +381,7 @@ def main():
             no_voice = None
             if route == ROUTE_INTERNATIONAL:
                 if client is None:
-                    no_voice = "elevenlabs is not configured"
+                    no_voice = "the international voice is not configured"
                 elif not has_eleven_voice(lang):
                     no_voice = "not one of the multilingual model's languages"
             elif lang not in SUPPORTED_LANGS:
@@ -431,9 +431,9 @@ def main():
             # A network failure is not a missing voice: the reply is speakable,
             # it just could not be fetched. Reported as a plain failure so it
             # does not read as an unsupported language.
-            log(f"ElevenLabs synthesis failed: {exc}")
+            log(f"international synthesis failed: {exc}")
             emit({"ok": False, "utt_id": req.get("utt_id"),
-                  "error": f"elevenlabs_tts: {exc}", "lang": lang})
+                  "error": f"international_tts: {exc}", "lang": lang})
         except Exception as exc:
             log(f"synthesis failed: {exc!r}")
             emit({"ok": False, "utt_id": req.get("utt_id"), "error": str(exc)})

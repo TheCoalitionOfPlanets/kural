@@ -191,8 +191,10 @@ observed identifying "epdi irukka" as Tamil and then answering in English. So
 the language is decided in code:
 
 1. The language is identified **from the audio**, before transcription, by
-   `facebook/mms-lid-126` in the STT worker. Where that abstains — a very short
-   utterance, a low-confidence prediction — [languages.py](realtime/languages.py)
+   `facebook/mms-lid-126` in the STT worker — *currently suspended
+   (`stt.lid.enabled: false`), so this step is skipped and every turn falls
+   straight through to the transcript path below.* Where it abstains — a very
+   short utterance, a low-confidence prediction — [languages.py](realtime/languages.py)
    falls back to the transcript: native script is unambiguous (a Tamil
    character proves Tamil), and romanized input ("enna panra", "kya kar rahe
    ho") is scored against per-language function words, the grammatical
@@ -222,6 +224,13 @@ Indian languages plus English, Indic-Mio speaks the same set. So that set is
 served by ElevenLabs — Scribe for the ear, `eleven_multilingual_v2` for the
 voice. `route_for()` in [languages.py](realtime/languages.py) is the single
 place that decision is made.
+
+> **Currently suspended.** `stt.lid.enabled` and `elevenlabs.enabled` are both
+> `false` in [realtime.yaml](config/realtime.yaml), so none of this path is
+> live: every turn is heard by SraVaani and spoken by Indic-Mio, and nothing
+> leaves the machine. A reply in a language the local voice cannot speak is
+> printed as text rather than spoken. The section below describes the design,
+> which is unchanged and returns by setting both flags back to `true`.
 
 The hard part is *knowing*. Handed Spanish, SraVaani does not fail — it returns
 confident Devanagari gibberish — so the transcript cannot reveal that it should

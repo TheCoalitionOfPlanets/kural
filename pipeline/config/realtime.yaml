@@ -58,7 +58,12 @@ stt:
   # With the model missing or enabled: false, every turn routes locally and the
   # pipeline behaves exactly as it did before this path existed.
   lid:
-    enabled: true
+    # SUSPENDED. The audio-level language router is off: every turn is heard by
+    # the local Indic ear (SraVaani), whatever language was actually spoken.
+    # Nothing is sent to ElevenLabs Scribe. The weights and every knob below
+    # are left in place so this is a one-line revert — set `enabled: true` to
+    # bring the router back exactly as it was.
+    enabled: false
     model_dir: stt/models/mms-lid-126
     # mms-lid-126 is a 966M-parameter wav2vec2 — bigger than the ASR it gates
     # for, and it only ever picks a language. float32 costs 3.69 GB, float16
@@ -174,7 +179,14 @@ elevenlabs:
   # and Indic-Mio speaks the same set, so that set is "local" and its
   # complement is "international" (pipeline/realtime/languages.py, LOCAL).
   # Speak Tamil and nothing below is touched; speak Spanish and it all is.
-  enabled: true
+  #
+  # SUSPENDED alongside `stt.lid`. Routing has two independent entry points --
+  # STT picks the ear from the audio, TTS picks the voice from the *reply's*
+  # language -- so turning the router off upstream does not by itself keep TTS
+  # home: an English-script reply the LLM produced in, say, Spanish would still
+  # have reached out. This closes the second door. A reply in a language the
+  # local voice cannot speak is now printed as text instead of spoken.
+  enabled: false
   # The key is read from the environment, never from this file — config is
   # committed, keys are not. Unset means the international path is unavailable,
   # which is reported at startup and per-turn rather than failing silently.

@@ -153,8 +153,8 @@ def main():
                 retries=el_cfg.get("retries", 1),
             )
         except ElevenLabsError as exc:
-            log(f"ElevenLabs speech-to-text unavailable ({exc}); international "
-                f"speech will be reported, not transcribed")
+            log(f"international speech-to-text unavailable ({exc}); "
+                f"international speech will be reported, not transcribed")
 
     # Which of MMS-LID's 126 labels the local ear can handle. Built once, from
     # the model's own label list, so it cannot drift from LOCAL_STT.
@@ -321,9 +321,9 @@ def main():
                 "elapsed_s": round(time.time() - t, 3),
             })
         except ElevenLabsError as exc:
-            log(f"ElevenLabs speech-to-text failed: {exc}")
+            log(f"international speech-to-text failed: {exc}")
             emit({"ok": False, "utt_id": req.get("utt_id"),
-                  "error": f"elevenlabs_stt: {exc}"})
+                  "error": f"international_stt: {exc}"})
         except Exception as exc:  # keep the worker alive across bad utterances
             log(f"transcribe failed: {exc!r}")
             emit({"ok": False, "utt_id": req.get("utt_id"), "error": str(exc)})
