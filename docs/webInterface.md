@@ -162,7 +162,7 @@ pipeline is actually doing rather than a guess:
 | `calibrated`, `listening` | orb breathing, "Listening" |
 | `speech_start` | orb tracks the microphone |
 | `utterance` | orb sweeps, "Thinking" |
-| `stt` | the user's turn, with its language and — only when it was not local — an `elevenlabs` tag |
+| `stt` | the user's turn, with its language and — only when it was not Set A — a `whisper` tag |
 | `llm` | the reply |
 | `audio` + bytes | decoded and played; orb tracks the output |
 | `barge_in` | one ripple outward |

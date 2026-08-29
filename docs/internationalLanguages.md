@@ -4,18 +4,16 @@ How a turn spoken in Spanish, Russian or Japanese is heard and answered, when
 every local model in the stack is Indic.
 
 - Code: [languages.py](../pipeline/realtime/languages.py),
-  [elevenlabs.py](../pipeline/realtime/elevenlabs.py),
   [worker_stt.py](../pipeline/workers/worker_stt.py),
   [worker_tts.py](../pipeline/workers/worker_tts.py),
   [workers.py](../pipeline/realtime/workers.py)
-- Config: [realtime.yaml](../pipeline/config/realtime.yaml) (`elevenlabs.*`,
-  `stt.lid.*`)
-- Prerequisite: `ELEVENLABS_API_KEY` in the environment
+- Config: [realtime.yaml](../pipeline/config/realtime.yaml) (`stt.lid.*`,
+  `stt.whisper.*`, `tts.mms_tts.*`)
+- Prerequisite: the Set B weights on disk. No API keys — every stage is local.
 - Tests: [test_languages.py](../pipeline/tests/test_languages.py) (routing
-  tables, the gate policy), [test_elevenlabs.py](../pipeline/tests/test_elevenlabs.py)
-  (wire format, retry policy),
+  tables, the gate policy),
   [test_stt_routing.py](../pipeline/tests/test_stt_routing.py) (the real worker
-  loop against stubbed models),
+  loop against stubbed models, including the lazy load),
   [test_international_flow.py](../pipeline/tests/test_international_flow.py)
   (the language surviving every stage)
 
@@ -70,7 +68,7 @@ STT worker, before transcription, and its answer chooses the ear:
 audio ─▶│  MMS-LID 126 │────────────────────▶│  SraVaani    │─▶ transcript
         │              │                     └──────────────┘
         └───────┬──────┘   anything else     ┌──────────────┐
-                └────────────────────────────▶│  Scribe      │─▶ transcript
+                └────────────────────────────▶│  Whisper l-v3│─▶ transcript
                                              └──────────────┘
 ```
 
@@ -88,9 +86,9 @@ be wrong, and none of it needs a GPU to reason about or to test.
 |---|---|---|
 | `min_confidence` | `0.55` | acting on a guess |
 | `min_audio_s` | `0.7` | LID on a fragment, which is a coin flip |
-| `max_audio_s` | `5.0` | paying for a 15 s forward pass to learn a 3 s answer |
+| `max_audio_s` | `5.0` | a 15 s forward pass to learn a 3 s answer |
 | `sticky_ttl_s` | `60` | one mumbled sentence dropping a conversation |
-| `hint_confidence` | `0.85` | handing Scribe a confidently wrong hint |
+| `hint_confidence` | `0.85` | handing Whisper a confidently wrong hint |
 
 ### 2.2 Every default fails toward local
 
@@ -98,10 +96,12 @@ When the gate is unsure, the turn stays local. This is asymmetric on purpose:
 
 - A wrong **local** route costs one bad transcript, visible immediately, on a
   turn the user will simply repeat.
-- A wrong **international** route costs a paid API call, and on a pipeline whose
-  traffic is mostly Indic, ambiguous turns are mostly Indic too.
+- A wrong **international** route costs loading a 1.55B model and a slower
+  turn, and on a pipeline whose traffic is mostly Indic, ambiguous turns are
+  mostly Indic too.
 
-So `min_confidence` is a floor for *spending*, not for accuracy.
+So `min_confidence` is a floor for *leaving the local stack*, not for
+accuracy.
 
 ### 2.3 Hysteresis that can only confirm
 
@@ -168,18 +168,19 @@ in `LOCAL` must be one Indic-Mio speaks.
 
 ---
 
-## 4. Scribe outranks the gate
+## 4. Whisper outranks the gate
 
-The gate picks the route. **Scribe picks the language.**
+The gate picks the route. **Whisper picks the language.**
 
-Scribe transcribed the words; LID classified the accent from a few seconds of
+Whisper transcribed the words; LID classified the accent from a few seconds of
 audio. Where they disagree, the one that heard the sentence is right — so the
-language reported by Scribe is what the rest of the turn runs on.
+language Whisper reports is what the rest of the turn runs on. It is read back
+from the language token Whisper itself emitted, not from the hint it was given.
 
 This makes a misroute self-repairing:
 
 ```
-LID: "spanish" (0.72)  ──▶  Scribe  ──▶  language_code: "tam"
+LID: "spanish" (0.72)  ──▶  Whisper  ──▶  <|ta|>
                                              │
                                              ▼
                             the turn is Tamil from here on:
@@ -187,11 +188,12 @@ LID: "spanish" (0.72)  ──▶  Scribe  ──▶  language_code: "tam"
                             Tamil reply, Indic-Mio voice
 ```
 
-The cost of the mistake is one API call. The user never hears it.
+The cost of the mistake is one slower turn. The user never hears it.
 
-The LID answer is passed to Scribe as a `language_code` hint only above
-`hint_confidence` (0.85), because a confidently wrong hint is worse than none —
-it pins Scribe to a language it would otherwise have detected correctly.
+The LID answer is passed to Whisper as a `language` hint only above
+`hint_confidence` (0.85), because a confidently wrong hint is worse than none.
+Whisper forced into the wrong language does not refuse — it **translates**,
+returning a fluent transcript of something the user did not say.
 
 ---
 
@@ -240,21 +242,21 @@ Below that choice the two backends are deliberately interchangeable:
 ```
 Indic-Mio ──┐
             ├──▶ float32 waveform ──▶ normalize() ──▶ WAV ──▶ Player
-ElevenLabs ─┘
+MMS-TTS   ──┘
 ```
 
 **Both paths normalize.** This is not tidiness — `normalize()` is echo-reduction
 layer 1 ([echoReduction.md](echoReduction.md)), and the barge-in gate
 ([bargeIn.md](bargeIn.md)) is tuned against its output. An un-normalized
-ElevenLabs reply would arrive at full scale in a room whose gate expects −23
+MMS-TTS reply would arrive at full scale in a room whose gate expects −23
 LUFS, bleed into the mic, clear the strict VAD threshold, and interrupt itself
 mid-sentence. Same file, same player, same guard: an international reply is
 interruptible exactly like a local one.
 
-Audio is requested as raw PCM (`output_format: pcm_24000`), not MP3, so there is
-nothing to decode — the bytes are reinterpreted as float32 and handed straight to
-the normalizer. A non-PCM `output_format` is refused at construction rather than
-producing a WAV that fails to open one reply later.
+VITS emits a float waveform directly, so there is nothing to decode — no codec
+step, no token extraction, none of what the Indic-Mio path needs. The rate
+differs (MMS checkpoints are 16 kHz, MioCodec 24 kHz), so it travels with the
+job rather than being assumed; the WAV header carries whichever it was.
 
 ---
 
@@ -266,9 +268,9 @@ existed before this path did.
 | Missing | Effect | Where you find out |
 |---|---|---|
 | LID weights | every turn routes locally | startup: `! language ID off (…)` |
-| `ELEVENLABS_API_KEY` | international turns dropped | startup, and per turn |
-| Network / 5xx | that one turn fails | `tts_failed` / `stt_failed` |
-| No ElevenLabs voice | reply printed, not spoken | `no <lang> voice, text only:` |
+| Whisper weights | international turns dropped | startup, and per turn |
+| A corrupt checkpoint | that one turn fails | `tts_failed` / `stt_failed` |
+| No MMS-TTS checkpoint | reply printed, not spoken | `no <lang> voice, text only:` |
 
 Indic and English are unaffected in every row.
 
@@ -278,66 +280,89 @@ pipeline giving a strange answer — the single worst outcome available — so t
 turn is dropped and the reason named:
 
 ```
-[u7] ! spanish speech, but ElevenLabs is not configured — turn dropped.
-     Set $ELEVENLABS_API_KEY and restart.
+[u7] ! spanish speech, but the international ear is unavailable — turn dropped.
 ```
 
 ### 7.1 Heard is not the same as speakable
 
-Scribe transcribes 99 languages; `eleven_multilingual_v2` speaks 29. The gap is
-real and is handled by the existing missing-voice path rather than by guessing:
-**Sinhala, Vietnamese, Thai, Hebrew, Hungarian, Norwegian, Persian, Swahili,
-Afrikaans**. Those replies are printed instead of mispronounced.
+Whisper transcribes 99 languages; `MMS_TTS_VOICES` lists the checkpoints this
+pipeline knows where to find. The gap is real and is handled by the existing
+missing-voice path rather than by guessing — the reply is printed instead of
+mispronounced.
 
-`test_international_flow.py` pins that list exactly, so a new gap can appear
-only deliberately.
+Unlike the previous stack, the gap is not a limit of the voice model: MMS ships
+over a thousand languages. Closing one is a line in `MMS_TTS_VOICES` plus its
+checkpoint on disk.
 
-### 7.2 Retries are silence
+`test_international_flow.py` sweeps every language the code tables can produce
+and pins the set that has no voice, so a new gap can appear only
+deliberately.
 
-A retry in a realtime loop is time the user spends listening to nothing. So only
-transient failures are retried (429, 5xx, transport), once by default, with a
-brief fixed backoff — exponential would be right for a batch job and wrong here,
-where past a second or so the turn is stale and failing fast is the better
-answer. A 4xx is a bad key or a bad request and returns the same answer however
-many times it is asked, so it is raised immediately. A 401 says which
-environment variable to set.
+### 7.2 The load is paid once, not per turn
+
+Both Set B models are loaded lazily — Whisper on the first turn that routes to
+it, each MMS-TTS checkpoint on the first reply in that language — and cached
+from then on. Set A and Set B are never both needed for the same turn, so
+holding Whisper's 3.1 GB beside SraVaani, Gemma and Indic-Mio would spend a
+third of a 12 GB card on a model most sessions never reach.
+
+The trade is that the *first* international turn is slow: a few seconds of model
+load on top of its own latency. Every one after it is at full speed. Failures
+are cached the same way — a missing directory will not fix itself between
+utterances, and retrying the load on every foreign turn would spend several
+seconds each time to reach the same answer.
 
 ---
 
-## 8. Cost, and seeing it
+## 8. Seeing which stack ran
 
-Every international turn is two paid calls: one Scribe transcription and one
-synthesis. Nothing else in the pipeline costs money, so the transcript line
-names the backend only when it is not the local one — a tag on every line would
-be noise, a tag on these is the only visible sign that a call was made:
+The transcript line names the backend only when it is not the Set A one — a tag
+on every line would be noise, a tag on these is the visible sign that the turn
+left the Indic stack:
 
 ```
-[u3] heard: எப்படி இருக்கீங்க                      ← free
-[u4] heard (spanish via elevenlabs): ¿Cómo estás?  ← paid
-[u4] synth 1.4s in 0.9s via elevenlabs             ← paid
+[u3] heard: எப்படி இருக்கீங்க                     ← Set A
+[u4] heard (spanish via Whisper): ¿Cómo estás?    ← Set B
+[u4] synth 1.4s in 0.9s via MMS-TTS               ← Set B
 ```
 
 If those tags appear on turns that were actually Indic, raise
-`stt.lid.min_confidence`.
+`stt.lid.min_confidence`. Nothing here costs money any more — every stage is
+local — but a wrong route still costs a model load and a slower turn.
 
 ---
 
 ## 9. Setup
 
 ```bash
-bash download.sh --skip-venvs        # fetches facebook/mms-lid-126 (~1.2 GB)
-export ELEVENLABS_API_KEY=sk_xxx
+hf download facebook/mms-lid-126     --local-dir stt/models/mms-lid-126
+hf download openai/whisper-large-v3  --local-dir stt/models/whisper-large-v3
+
+# One per language you expect, named by ISO 639-3:
+hf download facebook/mms-tts-spa --local-dir tts/models/mms-tts/spa
+hf download facebook/mms-tts-jpn --local-dir tts/models/mms-tts/jpn
 ```
+
+`MMS_TTS_VOICES` in [languages.py](../pipeline/realtime/languages.py) maps this
+pipeline's language names onto those codes. Two are easy to get wrong: Mandarin
+is `cmn` (there is no `zho` checkpoint) and Filipino ships as `tgl`.
 
 To turn the path off entirely, without removing anything:
 
 ```yaml
 stt:
   lid:
-    enabled: false      # every turn routes locally
-elevenlabs:
-  enabled: false        # no calls made from either worker
+    enabled: false       # every turn routes locally
+  whisper:
+    enabled: false       # the Set B ear is never loaded
+tts:
+  mms_tts:
+    enabled: false       # the Set B voice is never loaded
 ```
+
+Both TTS and STT need turning off, not just the router: routing has two
+independent entry points, and a reply the LLM produced in Spanish would still
+reach the Set B voice with only the router disabled.
 
 ---
 

@@ -122,7 +122,7 @@ def main():
             #
             # Upstream wins when it has an answer. The STT stage identifies the
             # language from the *audio*, and on the international path gets it
-            # from Scribe, which actually heard the words. Re-deriving it from
+            # from Whisper, which actually heard the words. Re-deriving it from
             # the transcript here would be strictly worse and, for a
             # Latin-script language, plainly wrong: detect_language() has no
             # markers for Spanish or German, so it calls them English and the

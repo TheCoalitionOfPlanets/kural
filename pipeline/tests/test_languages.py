@@ -15,7 +15,8 @@ from pipeline.realtime.languages import (  # noqa: E402
     SUPPORTED,
     RouteGate,
     detect_language,
-    has_eleven_voice,
+    has_mms_voice,
+    mms_voice_code,
     language_directive,
     language_from_code,
     route_for,
@@ -149,14 +150,24 @@ expect("مرحبا كيف حالك اليوم", "arabic")
 
 print("\nrouting — which stack owns the turn")
 for _lang in ("tamil", "hindi", "telugu", "kannada", "malayalam", "marathi",
-              "urdu", "assamese", "sanskrit", ENGLISH):
+              "assamese", "sanskrit", ENGLISH):
     check(f"{_lang} -> local", route_for(_lang) == ROUTE_LOCAL)
+
+# Urdu and Kashmiri are the split case, and the reason route_for takes a stage
+# at all: SraVaani's model card excludes both, Indic-Mio speaks both. So each
+# stage answers separately — the ear leaves, the voice stays home — and the
+# stage-less answer is "not fully local", which is what it should be.
+for _lang in ("urdu", "kashmiri"):
+    check(f"{_lang} is not heard locally",
+          route_for(_lang, stage="stt") == ROUTE_INTERNATIONAL)
+    check(f"{_lang} is spoken locally",
+          route_for(_lang, stage="tts") == ROUTE_LOCAL)
 
 for _lang in ("spanish", "russian", "japanese", "arabic", "korean", "chinese",
               "french", "german", "sinhala"):
-    check(f"{_lang} -> elevenlabs", route_for(_lang) == ROUTE_INTERNATIONAL)
+    check(f"{_lang} -> set B", route_for(_lang) == ROUTE_INTERNATIONAL)
 
-# No language established yet is not a reason to spend an API call.
+# No language established yet is not a reason to load the Set B stack.
 check("unknown language stays local", route_for(None) == ROUTE_LOCAL)
 check("empty language stays local", route_for("") == ROUTE_LOCAL)
 # Anything the tables have never heard of has no local voice by definition.
@@ -170,8 +181,8 @@ for _code, _name in (("spa", "spanish"), ("rus", "russian"), ("jpn", "japanese")
                      ("es", "spanish"), ("ja", "japanese"), ("ta", "tamil")):
     check(f"{_code} -> {_name}", language_from_code(_code) == _name)
 
-# Regional tags arrive from Scribe as "es-ES" / "spa-Latn"; only the primary
-# subtag names the language.
+# Regional tags arrive as "es-ES" / "spa-Latn"; only the primary subtag names
+# the language.
 check("es-ES -> spanish", language_from_code("es-ES") == "spanish")
 check("spa-Latn -> spanish", language_from_code("spa-Latn") == "spanish")
 check("no code -> nothing", language_from_code(None) is None)
@@ -180,12 +191,20 @@ check("no code -> nothing", language_from_code(None) is None)
 check("unknown code kept as-is", language_from_code("qqq") == "qqq")
 
 print("\ntts coverage — heard is not the same as speakable")
-check("spanish has an elevenlabs voice", has_eleven_voice("spanish"))
-check("japanese has an elevenlabs voice", has_eleven_voice("japanese"))
-# Scribe transcribes these; the multilingual voice does not speak them, so the
-# reply is shown as text instead of mispronounced.
-check("sinhala has no elevenlabs voice", not has_eleven_voice("sinhala"))
-check("vietnamese has no elevenlabs voice", not has_eleven_voice("vietnamese"))
+check("spanish has an mms voice", has_mms_voice("spanish"))
+check("japanese has an mms voice", has_mms_voice("japanese"))
+# The code is what the worker actually needs: checkpoints are per-language
+# directories named by ISO 639-3, so "can it be spoken" and "which one loads"
+# are the same question.
+check("spanish maps to its checkpoint", mms_voice_code("spanish") == "spa")
+# MMS ships Mandarin as `cmn`, not `zho`, and Filipino under Tagalog — the two
+# codes most likely to be written from memory and be wrong.
+check("chinese maps to cmn", mms_voice_code("chinese") == "cmn")
+check("filipino maps to tgl", mms_voice_code("filipino") == "tgl")
+# Whisper transcribes these; no checkpoint is configured for them, so the reply
+# is shown as text instead of mispronounced.
+check("klingon has no mms voice", not has_mms_voice("klingon"))
+check("no language has no voice", mms_voice_code(None) is None)
 
 print("\nreply directive")
 # Naming the script is right for Tamil and Japanese, and actively wrong for

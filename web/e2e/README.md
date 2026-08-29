@@ -27,4 +27,4 @@ npx next start -p 3100
 node e2e/voice.mjs
 ```
 
-Nothing here needs a GPU, model weights, or an ElevenLabs key.
+Nothing here needs a GPU or model weights.

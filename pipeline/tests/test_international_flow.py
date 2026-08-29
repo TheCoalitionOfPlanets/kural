@@ -5,7 +5,7 @@
 The routing decision is made once, at STT, from the waveform. Everything after
 that depends on it arriving intact: the LLM needs it because a Spanish
 transcript is Latin script that detect_language() reads as English, and TTS
-needs it because it is what chooses between the local voice and ElevenLabs. So
+needs it because it is what chooses between the local voice and MMS-TTS. So
 what is tested here is the plumbing between the stages, with the models
 replaced by scripted fakes.
 """
@@ -108,13 +108,13 @@ def payload(events, kind):
     return None
 
 
-print("international turn — Scribe's language reaches both the model and TTS")
+print("international turn — Whisper's language reaches both the model and TTS")
 job, events, (stt_w, llm_w, tts_w) = run_pipeline(
     {"ok": True, "text": "¿Cómo estás?", "lang": "spanish", "lang_code": "spa",
-     "route": "international", "backend": "elevenlabs", "confidence": 0.98},
+     "route": "international", "backend": "whisper", "confidence": 0.98},
     {"ok": True, "text": "Estoy bien, gracias.", "lang": "spanish"},
-    {"ok": True, "wav_path": "/tmp/u1.wav", "sample_rate": 24000,
-     "lang": "spanish", "backend": "elevenlabs", "audio_s": 1.4},
+    {"ok": True, "wav_path": "/tmp/u1.wav", "sample_rate": 16000,
+     "lang": "spanish", "backend": "mms-tts", "audio_s": 1.4},
 )
 check("a wav job came out the far end", job is not None)
 # The rate travels with the audio because LID and SraVaani are both 16kHz-only
@@ -128,11 +128,14 @@ check("llm worker was told the language",
 check("tts worker was told the language",
       tts_w.calls and tts_w.calls[0].get("lang") == "spanish")
 check("stt event names the backend",
-      payload(events, "stt").get("backend") == "elevenlabs")
+      payload(events, "stt").get("backend") == "whisper")
 check("tts event names the backend",
-      payload(events, "tts").get("backend") == "elevenlabs")
+      payload(events, "tts").get("backend") == "mms-tts")
+# MMS-TTS checkpoints are 16kHz where Indic-Mio is 24k; the rate travels with
+# the job rather than being assumed, so playback opens the file correctly
+# either way.
 check("wav job carries the international sample rate",
-      job is not None and job.sample_rate == 24000)
+      job is not None and job.sample_rate == 16000)
 
 print("\nlocal turn — nothing about it changed")
 job, events, (stt_w, llm_w, tts_w) = run_pipeline(
@@ -170,20 +173,23 @@ job, events, _ = run_pipeline(
     {"ok": True, "wav_path": "/tmp/u1.wav", "sample_rate": 24000},
 )
 check("nothing is spoken", job is None)
-# The fix is an API key, not something wrong with the audio, so it must not be
-# reported as an STT failure.
+# The fix is fetching the Set B weights, not something wrong with the audio, so
+# it must not be reported as an STT failure.
 check("reported as its own event", "stt_no_international" in kinds(events))
 check("not reported as a generic failure", "stt_failed" not in kinds(events))
 check("the event names the language",
       payload(events, "stt_no_international").get("lang") == "spanish")
 
 print("\nno voice — heard perfectly, cannot be spoken")
+# Whisper hears far more languages than MMS_TTS_VOICES lists checkpoints for,
+# so this gap is real: transcribed and answered correctly, with no voice to say
+# it in.
 job, events, _ = run_pipeline(
-    {"ok": True, "text": "ආයුබෝවන්", "lang": "sinhala",
-     "route": "international", "backend": "elevenlabs", "confidence": 0.91},
-    {"ok": True, "text": "ඔබට කෙසේද", "lang": "sinhala"},
-    {"ok": False, "error": "no_voice", "lang": "sinhala",
-     "reason": "not one of the multilingual model's languages"},
+    {"ok": True, "text": "Kumusta ka?", "lang": "cebuano",
+     "route": "international", "backend": "whisper", "confidence": 0.91},
+    {"ok": True, "text": "Maayo man.", "lang": "cebuano"},
+    {"ok": False, "error": "no_voice", "lang": "cebuano",
+     "reason": "not one of the configured MMS-TTS languages"},
 )
 check("nothing is spoken", job is None)
 check("reported as a missing voice", "tts_no_voice" in kinds(events))
@@ -191,16 +197,16 @@ check("not reported as a crash", "tts_failed" not in kinds(events))
 # The answer is still correct; the console prints it as text, so it has to
 # carry both the reply and why it was not read aloud.
 check("the reply text survives for printing",
-      payload(events, "tts_no_voice").get("text") == "ඔබට කෙසේද")
+      payload(events, "tts_no_voice").get("text") == "Maayo man.")
 check("the reason survives for printing",
-      "multilingual" in (payload(events, "tts_no_voice").get("reason") or ""))
+      "MMS-TTS" in (payload(events, "tts_no_voice").get("reason") or ""))
 
-print("\nnetwork failure — a real failure, not a missing voice")
+print("\nsynthesis failure — a real failure, not a missing voice")
 job, events, _ = run_pipeline(
     {"ok": True, "text": "¿Cómo estás?", "lang": "spanish",
-     "backend": "elevenlabs", "confidence": 0.98},
+     "backend": "whisper", "confidence": 0.98},
     {"ok": True, "text": "Estoy bien.", "lang": "spanish"},
-    {"ok": False, "error": "elevenlabs_tts: could not reach api", "lang": "spanish"},
+    {"ok": False, "error": "OSError('checkpoint is corrupt')", "lang": "spanish"},
 )
 check("nothing is spoken", job is None)
 check("reported as a failure", "tts_failed" in kinds(events))
@@ -214,8 +220,8 @@ print("\nvoice coverage — the gate must not name a language TTS then refuses")
 import importlib.util  # noqa: E402
 
 from pipeline.realtime.languages import (  # noqa: E402
-    ELEVEN_TTS_LANGUAGES,
     LOCAL,
+    MMS_TTS_LANGUAGES,
     ROUTE_INTERNATIONAL,
     route_for,
 )
@@ -239,18 +245,22 @@ if _gap:
 
 # The mirror of the same mistake, swept across every language the code tables
 # can produce: each one must have a voice on whichever stack it routes to, or
-# be a gap someone decided to accept. Scribe hears far more languages than the
-# multilingual voice speaks, so the gaps are real — pinning them here means a
-# new one cannot appear quietly, only deliberately.
-KNOWN_TEXT_ONLY = {
-    "sinhala", "vietnamese", "thai", "hebrew", "hungarian", "norwegian",
-    "persian", "swahili", "afrikaans",
-}
+# be a gap someone decided to accept. Whisper hears far more languages than
+# MMS_TTS_VOICES lists checkpoints for, so the gaps are real — pinning them
+# here means a new one cannot appear quietly, only deliberately.
+#
+# MMS ships over a thousand languages, so every gap below is a line missing
+# from MMS_TTS_VOICES rather than a language the model family cannot speak.
+KNOWN_TEXT_ONLY = set()
+# stage="tts" because this asks which model must *speak* the reply, which is
+# the same question the worker asks. The stage-less answer would call Urdu and
+# Kashmiri international — true of the ear, since SraVaani cannot hear them —
+# and then look for them in the MMS table, when Indic-Mio speaks both.
 _all_names = set(_iso639_3.values()) | set(_iso639_1.values())
 _voiceless = set()
 for _lang in _all_names:
-    if route_for(_lang) == ROUTE_INTERNATIONAL:
-        if _lang not in ELEVEN_TTS_LANGUAGES:
+    if route_for(_lang, stage="tts") == ROUTE_INTERNATIONAL:
+        if _lang not in MMS_TTS_LANGUAGES:
             _voiceless.add(_lang)
     elif _lang not in _worker_tts.SUPPORTED_LANGS:
         _voiceless.add(_lang)

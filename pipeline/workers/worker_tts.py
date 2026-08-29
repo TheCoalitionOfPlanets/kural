@@ -13,13 +13,22 @@ codes, and decoded to a waveform by MioCodec.
 
 What Indic-Mio cannot do is speak Spanish, Russian or Japanese — its language
 set stops at India's border. Replies in those languages are synthesized by
-ElevenLabs instead, chosen per utterance by `languages.route_for()` on the
-reply's language. The two backends are deliberately interchangeable below the
-waist: both produce a float32 waveform, both go through the same loudness
-normalization, and both are written to the same WAV. That matters more than it
-looks — `normalize()` is echo-reduction layer 1, and an un-normalized
-international reply would come back hot enough to trip the barge-in gate and
-cut itself off mid-sentence.
+MMS-TTS instead, the VITS model from Meta's Massively Multilingual Speech
+project, chosen per utterance by `languages.route_for()` on the reply's
+language.
+
+MMS-TTS is not one model but one checkpoint *per language* (~145 MB each), so
+it is loaded lazily and cached per language: a session that never leaves Tamil
+never loads one, and a session that switches to Spanish pays for `spa` once.
+VITS is also non-autoregressive, which matters here — it synthesizes in roughly
+constant time rather than token by token, so a long Set B reply does not cost
+proportionally more latency the way Indic-Mio does.
+
+The two backends are deliberately interchangeable below the waist: both produce
+a float32 waveform, both go through the same loudness normalization, and both
+are written to the same WAV. That matters more than it looks — `normalize()` is
+echo-reduction layer 1, and an un-normalized international reply would come
+back hot enough to trip the barge-in gate and cut itself off mid-sentence.
 
 Protocol (JSON lines on stdin/stdout):
     <- {"cmd": "init", "config": {...}}
@@ -46,8 +55,11 @@ sys.stdout = sys.stderr
 # shared routing tables are loaded by path — the same trick the LLM and STT
 # workers use. Both modules are stdlib-only for exactly this reason.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from realtime.elevenlabs import ElevenLabs, ElevenLabsError  # noqa: E402
-from realtime.languages import ROUTE_INTERNATIONAL, has_eleven_voice, route_for  # noqa: E402
+from realtime.languages import (  # noqa: E402
+    ROUTE_INTERNATIONAL,
+    mms_voice_code,
+    route_for,
+)
 
 # Indic-Mio's supported languages (frontmatter of the model card), mapped to
 # this pipeline's language names from realtime/languages.py. A reply in a
@@ -309,34 +321,86 @@ def main():
         audio = out.squeeze().to(torch.float32).cpu().numpy()
         return audio, sample_rate
 
-    # -- the international voice -------------------------------------------
-    el_cfg = cfg.get("elevenlabs") or {}
-    client = None
-    if el_cfg.get("enabled", True):
-        try:
-            client = ElevenLabs(
-                os.environ.get(el_cfg.get("api_key_env", "ELEVENLABS_API_KEY"), ""),
-                tts_model=el_cfg.get("tts_model"),
-                voice_id=el_cfg.get("voice_id"),
-                output_format=el_cfg.get("output_format"),
-                voice_settings=el_cfg.get("voice_settings"),
-                timeout_s=el_cfg.get("tts_timeout_s", el_cfg.get("timeout_s", 20)),
-                retries=el_cfg.get("retries", 1),
-            )
-        except ElevenLabsError as exc:
-            log(f"international voice unavailable ({exc}); replies in "
-                f"languages Indic-Mio does not speak will be text-only")
+    # -- the international voice: MMS-TTS (VITS) ---------------------------
+    #
+    # One checkpoint per language, each ~145 MB, laid out under `model_dir` by
+    # ISO 639-3 code — the same names Meta publishes them under:
+    #
+    #     tts/models/mms-tts/spa/     facebook/mms-tts-spa
+    #     tts/models/mms-tts/jpn/     facebook/mms-tts-jpn
+    #
+    # Loaded on first use and cached per language rather than up front: a
+    # session that never leaves Tamil should not pay for a Spanish voice, and
+    # `MMS_TTS_VOICES` lists more languages than any one conversation will use.
+    mms_cfg = cfg.get("mms_tts") or {}
+    mms_enabled = mms_cfg.get("enabled", True)
+    mms_root = mms_cfg.get("model_dir")
+    mms_dtype_name = mms_cfg.get("dtype", "float32")
+    # lang -> (model, tokenizer, rate), or the string explaining why not. Both
+    # outcomes are cached: a checkpoint that is missing now will still be
+    # missing on the next Spanish reply, and re-deriving that costs a disk walk
+    # per turn to reach the same answer.
+    mms_cache = {}
 
-    def synthesize_eleven(text):
+    mms_error = None
+    if not mms_enabled:
+        mms_error = "disabled in config"
+    elif not mms_root or not os.path.isdir(mms_root):
+        mms_error = f"model_dir {mms_root!r} not found"
+
+    def _load_mms(lang, code):
+        """(bundle, error) for one language's VITS checkpoint; one is None."""
+        if lang in mms_cache:
+            entry = mms_cache[lang]
+            return (None, entry) if isinstance(entry, str) else (entry, None)
+
+        path = os.path.join(mms_root, code)
+        if not os.path.isdir(path):
+            err = (f"no MMS-TTS checkpoint at {path} — fetch "
+                   f"facebook/mms-tts-{code} into it")
+            mms_cache[lang] = err
+            return None, err
+
+        from transformers import AutoTokenizer as _AutoTokenizer, VitsModel
+
+        dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16,
+                 "float32": torch.float32}.get(mms_dtype_name, torch.float32)
+        t = time.time()
+        try:
+            vits = VitsModel.from_pretrained(path, dtype=dtype).to(device).eval()
+            # MMS tokenizers are per-language uroman/character vocabularies, so
+            # the tokenizer must come from the same checkpoint as the weights —
+            # sharing one across languages silently mis-encodes the text.
+            vits_tok = _AutoTokenizer.from_pretrained(path)
+        except Exception as exc:
+            err = repr(exc)
+            log(f"MMS-TTS {code} failed to load ({err})")
+            mms_cache[lang] = err
+            return None, err
+
+        bundle = (vits, vits_tok, int(vits.config.sampling_rate))
+        mms_cache[lang] = bundle
+        log(f"MMS-TTS {code} loaded in {time.time() - t:.1f}s "
+            f"({bundle[2]} Hz, {mms_dtype_name})")
+        return bundle, None
+
+    def synthesize_mms(text, lang, code):
         """Same contract as synthesize(): (float32 mono waveform, sample rate).
 
-        The response is raw little-endian PCM16 rather than MP3, so there is
-        nothing to decode — just a reinterpretation of the same bytes into the
-        float32 the normalizer and the WAV writer already expect.
+        VITS is non-autoregressive: one forward pass produces the whole
+        waveform, so there are no tokens to extract and no codec to decode
+        through. The output is already a float waveform in [-1, 1], which is
+        exactly what the normalizer and the WAV writer downstream expect.
         """
-        raw, rate = client.synthesize(text)
-        pcm = np.frombuffer(raw, dtype="<i2")
-        return pcm.astype(np.float32) / 32768.0, rate
+        bundle, err = _load_mms(lang, code)
+        if bundle is None:
+            raise RuntimeError(err or "mms-tts unavailable")
+        vits, vits_tok, rate = bundle
+
+        inputs = vits_tok(text, return_tensors="pt").to(device)
+        with torch.inference_mode():
+            out = vits(**inputs).waveform
+        return out.squeeze().to(torch.float32).cpu().numpy(), rate
 
     emit({
         "event": "ready",
@@ -346,7 +410,11 @@ def main():
         # False means the local voice is re-invented every utterance, which
         # sounds like a bug long before anyone suspects the config.
         "reference_voice": reference is not None,
-        "elevenlabs": client is not None,
+        # Whether the Set B voices *can* be loaded, not whether any is: they
+        # are per-language and lazy, so nothing is resident until a reply in
+        # one of them arrives.
+        "international_tts": mms_error is None,
+        "international_tts_error": mms_error,
         "vram_gb": round(torch.cuda.memory_allocated() / 1024**3, 2),
     })
 
@@ -365,25 +433,31 @@ def main():
         lang = req.get("lang") or "english"
         # The reply's own language picks the voice, not the route the *user's*
         # audio took. They usually agree, but when they do not the reply is
-        # what is about to be spoken — so a turn misrouted to Scribe and then
+        # what is about to be spoken — so a turn misrouted to Whisper and then
         # correctly identified as Tamil still comes back in the local voice.
         # stage="tts" because this is the *voice* decision, and Indic-Mio
         # speaks two languages SraVaani cannot hear (Urdu, Kashmiri). Asking
-        # the combined set would send an Urdu reply to ElevenLabs even though
+        # the combined set would send an Urdu reply to MMS-TTS even though
         # the local voice handles it.
         route = route_for(lang, stage="tts")
-        backend = "elevenlabs" if route == ROUTE_INTERNATIONAL else "indic-mio"
+        backend = "mms-tts" if route == ROUTE_INTERNATIONAL else "indic-mio"
         try:
             # Same gap, two voices: a language neither backend speaks is
             # reported rather than read aloud in the wrong one, which sounds
             # like a bug and mispronounces every word. The orchestrator prints
             # the reply as text instead.
             no_voice = None
+            voice_code = None
             if route == ROUTE_INTERNATIONAL:
-                if client is None:
-                    no_voice = "the international voice is not configured"
-                elif not has_eleven_voice(lang):
-                    no_voice = "not one of the multilingual model's languages"
+                voice_code = mms_voice_code(lang)
+                if mms_error is not None:
+                    no_voice = f"the international voice is unavailable ({mms_error})"
+                elif voice_code is None:
+                    # MMS ships over a thousand languages, so this is a gap in
+                    # this pipeline's table rather than in the model family —
+                    # adding the language is one line in MMS_TTS_VOICES plus
+                    # its checkpoint on disk.
+                    no_voice = "not one of the configured MMS-TTS languages"
             elif lang not in SUPPORTED_LANGS:
                 no_voice = "not one of Indic-Mio's languages"
 
@@ -396,14 +470,14 @@ def main():
 
             t = time.time()
             if route == ROUTE_INTERNATIONAL:
-                audio, rate = synthesize_eleven(req["text"])
+                audio, rate = synthesize_mms(req["text"], lang, voice_code)
             else:
                 audio, rate = synthesize(req["text"])
             if audio.size == 0:
                 emit({"ok": False, "utt_id": req.get("utt_id"),
                       "error": "empty_audio", "lang": lang})
                 continue
-            # Both backends normalize. Skipping it for ElevenLabs would put a
+            # Both backends normalize. Skipping it for MMS-TTS would put a
             # full-scale reply into a room whose barge-in gate was tuned
             # against a -23 LUFS one, and the reply would interrupt itself.
             audio = normalize(audio, rate)
@@ -427,13 +501,6 @@ def main():
                 "audio_s": round(len(audio) / rate, 2),
                 "elapsed_s": round(time.time() - t, 3),
             })
-        except ElevenLabsError as exc:
-            # A network failure is not a missing voice: the reply is speakable,
-            # it just could not be fetched. Reported as a plain failure so it
-            # does not read as an unsupported language.
-            log(f"international synthesis failed: {exc}")
-            emit({"ok": False, "utt_id": req.get("utt_id"),
-                  "error": f"international_tts: {exc}", "lang": lang})
         except Exception as exc:
             log(f"synthesis failed: {exc!r}")
             emit({"ok": False, "utt_id": req.get("utt_id"), "error": str(exc)})

@@ -332,7 +332,7 @@ export class VoiceClient {
           kind: "warn",
           message:
             `${msg.lang ?? "International"} speech was recognised, but ` +
-            `ElevenLabs is not configured — the turn was dropped.`,
+            `the international ear is unavailable — the turn was dropped.`,
         });
         this.setState("listening");
         return;

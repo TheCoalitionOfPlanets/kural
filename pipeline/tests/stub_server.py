@@ -7,7 +7,7 @@ models is the production path: the same Session, the same VAD, the same
 WebPlayer handshake — so the socket protocol, the frame contract and the event
 stream are exactly what the real server produces.
 
-Needs no GPU, no model weights, and no ElevenLabs key.
+Needs no GPU and no model weights.
 """
 import math
 import pathlib
@@ -31,7 +31,8 @@ class FakeWorker:
 
     def start(self, timeout_s=300):
         return {"event": "ready", "load_s": 0.0, "lid": True,
-                "elevenlabs": True, "vram_gb": 0.0}
+                "international_stt": True, "international_tts": True,
+                "vram_gb": 0.0}
 
     def run(self, payload):
         if self.name == "stt":

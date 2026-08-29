@@ -1,8 +1,8 @@
 # The voice
 
-The assistant speaks through two different TTS models — Indic-Mio locally,
-ElevenLabs for languages Indic-Mio does not know — and nothing makes them sound
-alike by default. This is how they are pinned to one speaker.
+The assistant speaks through two different TTS models — Indic-Mio for the
+languages it knows, MMS-TTS for everything else. This is how the Indic-Mio half
+is pinned to one speaker, and why the other half cannot be.
 
 ## Why a reference clip is mandatory
 
@@ -37,35 +37,29 @@ change the assistant's voice.
 
 To change the voice, replace that file and restart. Nothing else needs editing.
 
-## Making ElevenLabs match
+## The Set B voice is a different speaker, and stays one
 
-ElevenLabs cannot be *configured* to imitate the local voice. `voice_id` picks
-from their catalogue, and `stability` / `similarity_boost` only control how
-consistently that chosen voice is reproduced. The only mechanism that transfers
-a voice is **Instant Voice Cloning**: upload reference audio, get a new
-`voice_id` back.
+MMS-TTS has **no cloning and no voice selection**. Each language ships one
+checkpoint with one speaker baked into the weights, so `tts.reference_wav` has
+no effect on it — there is no parameter to pass the clip to.
 
-`pipeline/tools/clone_voice.py` does this with the *same* clip the local model
-uses, which is the point — one reference, two stacks:
+This is a real, audible limit rather than a configuration gap: switching from
+Tamil to Spanish mid-conversation switches speaker, and nothing in the config
+can prevent that. Worth stating plainly because it looks like a bug the first
+time it happens.
 
-```
-venv/Scripts/python.exe pipeline/tools/clone_voice.py
-```
+Two things make it less jarring than it sounds:
 
-It prints a `voice_id` to paste into `elevenlabs.voice_id` in
-`pipeline/config/realtime.yaml`.
+* **It only happens on a language switch.** Within a language the voice is
+  fixed, because the checkpoint is.
+* **Loudness normalization applies to both**, so the two voices at least match
+  in level — which is also what keeps a Set B reply from tripping the barge-in
+  gate and cutting itself off.
 
-**This requires a paid ElevenLabs tier** (Starter and up). On the free tier the
-script exits with that explanation rather than a bare HTTP error. Everything
-else keeps working meanwhile — international replies just use the stock voice,
-so switching to Spanish switches speaker.
-
-### What "matching" actually gets you
-
-Timbre transfers; prosody does not. ElevenLabs speaking Spanish applies its own
-rhythm and stress, not Indic-Mio's. The realistic outcome is *the same person
-speaking another language* rather than an identical voice — which is the ceiling
-for two independent models, and is the part a listener actually notices.
+The alternative would be a multi-speaker or cloning model for Set B, which
+costs either an API dependency or a much larger checkpoint per language. The
+trade taken here is 145 MB per language, entirely local, at the price of one
+fixed voice per language.
 
 ## Two fixes this depended on
 
@@ -124,13 +118,14 @@ do not agree:
 
 ### Urdu and Kashmiri
 
-These are the reason the split exists. SraVaani cannot hear them, Indic-Mio
-speaks them, and ElevenLabs has no voice for either. So they are **heard by
-Scribe and spoken locally** — the only combination where both halves work. A
-single shared set would have broken one half whichever way it was set:
+These are the reason the split exists. SraVaani cannot hear them and Indic-Mio
+speaks them, so they are **heard by Whisper and spoken locally** — the only
+combination where both halves work. A single shared set would have broken one
+half whichever way it was set:
 
 * all-local → Urdu transcribed by a model that has never seen it
-* all-international → Urdu replies silent, since ElevenLabs cannot say them
+* all-international → Urdu spoken by a generic MMS checkpoint when a model
+  trained on it was available
 
 ### The seven LID cannot name
 
@@ -140,13 +135,13 @@ gate abstains and `route_for` defaults to local, which is where they belong.
 Worth knowing only because it means those languages are never *deliberately*
 routed — they arrive local by falling through.
 
-## Why English was being sent to ElevenLabs
+## Why English was being sent to the Set B stack
 
 Two independent bugs, both visible in one log line:
 
-    [u0002] heard (english via elevenlabs): Hi, how are you?
+    [u0002] heard (english via Whisper): Hi, how are you?
 
-English is local, so that call should never have been made.
+English is local, so that route should never have been taken.
 
 ### 1. The top-1 label is biased toward leaving
 
@@ -163,20 +158,24 @@ the argmax said. Measured local mass: English 0.997–0.999, code-mixed
 Hindi/English 0.822, Tamil 1.000, noise 0.015. All 111 foreign labels still
 route international.
 
-### 2. Scribe's language became the reply language, unchecked
+### 2. The Set B ear's language became the reply language, unchecked
 
-`heard = language_from_code(result["language_code"])` was taken on faith. Scribe
-misnames short or noisy clips — reporting Korean or Chinese for English — and
-that name is not cosmetic: it becomes `Reply ONLY in Korean` in the LLM's
-directive and a Korean voice at synthesis. That is the wrong-language output.
+`heard = language_from_code(result["language_code"])` was taken on faith. The
+international ear misnames short or noisy clips — reporting Korean or Chinese
+for English — and that name is not cosmetic: it becomes `Reply ONLY in Korean`
+in the LLM's directive and a Korean voice at synthesis. That is the
+wrong-language output.
 
-The transcript is now cross-checked against its own script: when Scribe's
+The transcript is now cross-checked against its own script: when the reported
 language and the text's script belong to **different writing systems**, the text
 wins. Languages that share a script (Hindi/Marathi in Devanagari) are left
 alone, since script cannot separate them and the disagreement is not evidence of
 an error.
 
-| transcript | Scribe said | result |
+This survived the move from Scribe to Whisper unchanged — Whisper has the same
+failure mode on short clips, and the same guard catches it.
+
+| transcript | the ear said | result |
 |---|---|---|
 | `Hi, how are you?` | korean | **english** — corrected |
 | `Hi, how are you?` | chinese | **english** — corrected |

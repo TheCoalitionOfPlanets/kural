@@ -20,7 +20,7 @@ export interface Turn {
   text: string;
   /** Language decided from the audio, not from the words. */
   lang?: string | null;
-  /** "sravaani" | "elevenlabs" | "indic-mio" — only shown when not local. */
+  /** "sravaani" | "whisper" | "indic-mio" | "mms-tts" — shown when not Set A. */
   backend?: string | null;
   /** The reply could not be spoken; it is text only. */
   textOnly?: boolean;

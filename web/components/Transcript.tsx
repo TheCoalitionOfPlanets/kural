@@ -10,7 +10,11 @@ interface Props {
   active: boolean;
 }
 
-/** The local stack; anything else was heard or spoken by ElevenLabs. */
+/**
+ * Set A — the Indic-specialised models that handle most turns. Anything else
+ * was heard by Whisper or spoken by MMS-TTS, which is worth showing: it is the
+ * only visible sign that the turn left the local Indic stack.
+ */
 const LOCAL_BACKENDS = new Set(["sravaani", "indic-mio"]);
 
 export function Transcript({ turns, active }: Props) {
@@ -53,7 +57,7 @@ export function Transcript({ turns, active }: Props) {
       aria-label="Conversation transcript"
     >
       {turns.map((turn) => {
-        const remote = turn.backend != null && !LOCAL_BACKENDS.has(turn.backend);
+        const setB = turn.backend != null && !LOCAL_BACKENDS.has(turn.backend);
         return (
           <div
             key={turn.id}
@@ -63,9 +67,9 @@ export function Transcript({ turns, active }: Props) {
               <div className={styles.bubble}>{turn.text}</div>
               <div className={styles.meta}>
                 {turn.lang && <span className={styles.tag}>{turn.lang}</span>}
-                {remote && (
-                  <span className={`${styles.tag} ${styles.remote}`}>
-                    elevenlabs
+                {setB && (
+                  <span className={`${styles.tag} ${styles.setB}`}>
+                    {turn.backend}
                   </span>
                 )}
                 {turn.textOnly && (

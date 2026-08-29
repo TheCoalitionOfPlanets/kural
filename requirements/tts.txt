@@ -2,7 +2,7 @@
 #
 # Indic-Mio is a standard transformers causal LM (Qwen3-based), so this pins
 # the same transformers/torch family as reasoning/venv. torch/torchvision
-# come from the PyTorch CUDA index in download.sh, not from this file.
+# come from the PyTorch CUDA index, not from this file.
 transformers==5.15.0
 tokenizers==0.22.2
 huggingface_hub==1.28.0
@@ -18,11 +18,12 @@ miocodec @ git+https://github.com/Aratako/MioCodec
 
 # Loudness normalization — tts.normalize in realtime.yaml (echo reduction
 # layer 1). The worker degrades gracefully without it, but the echo loop is
-# noticeably worse. It applies to the ElevenLabs voice too: an un-normalized
+# noticeably worse. It applies to the MMS-TTS voice too: an un-normalized
 # international reply arrives hot enough to trip the barge-in gate and cut
 # itself off.
 #
-# The ElevenLabs voice itself needs no pin — realtime/elevenlabs.py is stdlib
-# only, and asks for raw PCM so there is no decoder to install.
+# MMS-TTS (VITS) needs no pin of its own — `VitsModel` ships in the
+# transformers pin above, and its per-language checkpoints are loaded on
+# demand (tts.mms_tts in pipeline/config/realtime.yaml).
 pyloudnorm==0.2.0
 soundfile==0.14.0

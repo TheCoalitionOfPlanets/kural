@@ -28,21 +28,34 @@ from .workers import LLMStage, PlaybackStage, STTStage, TTSStage
 # against its own cwd.
 _PATH_KEYS = ("prompt_file", "voices_dir")
 
+# The same, one level down: the Set B models hang off their stage's section
+# (stt.whisper, tts.mms_tts) rather than the top level, so their model_dir
+# needs the same treatment as the resident models' — a relative path here
+# resolves against the *child's* cwd, and the child is started elsewhere.
+_NESTED_PATH_KEYS = {
+    "stt": ("lid", "whisper"),
+    "tts": ("mms_tts",),
+}
+
 
 def spawn_worker(cfg, root, key, label, on_event=None, on_worker_log=None,
                  timeout_s=300):
     """Start one model subprocess and wait for it to report ready."""
     on_event = on_event or (lambda *a, **k: None)
     section = dict(cfg[key])
-    # One ElevenLabs section, consumed by two workers: STT for the
-    # international ear, TTS for the international voice.
-    if key in ("stt", "tts"):
-        section["elevenlabs"] = cfg.get("elevenlabs") or {}
     # Config paths are repo-relative; the child resolves them against its own
     # cwd, so make them absolute here.
     for path_key in _PATH_KEYS:
         if section.get(path_key):
             section[path_key] = str(root / section[path_key])
+    for sub in _NESTED_PATH_KEYS.get(key, ()):
+        # Copied before mutating: `cfg` is the caller's parsed config and may
+        # be reused (the server spawns workers more than once), so writing an
+        # absolute path back into it would be a one-way change.
+        block = dict(section.get(sub) or {})
+        if block.get("model_dir"):
+            block["model_dir"] = str(root / block["model_dir"])
+            section[sub] = block
     wp = WorkerProcess(
         name=label,
         python=root / section["python"],

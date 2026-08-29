@@ -9,14 +9,20 @@ the routing decision has to be made *before* transcription, from the waveform.
 That is what the LID gate is. `facebook/mms-lid-126` classifies the language of
 the audio directly, in one small forward pass, and its answer chooses the ear:
 
-    indic / english  ->  SraVaani, locally, free
-    anything else    ->  ElevenLabs Scribe
+    indic / english  ->  SraVaani      (Set A, resident)
+    anything else    ->  Whisper large-v3  (Set B, loaded on demand)
 
-LID only decides the *route*. On the international path Scribe's own detected
+Both ears are local — there is no network on this path. Whisper is *not* held
+resident, though: Set A and Set B are never both needed for the same turn, and
+at 3.1 GB it does not belong on the card next to SraVaani, Gemma and the local
+voice. It is loaded the first time a turn actually routes to it and kept from
+then on, so the cost is paid once rather than per utterance.
+
+LID only decides the *route*. On the international path Whisper's own detected
 language is what the rest of the turn runs on, because it is the better
-detector — which is also how a misroute repairs itself: if LID says Spanish and
-Scribe says Tamil, the turn is Tamil from here on and TTS goes back to the
-local voice.
+detector — it heard the words, not just the accent. That is also how a misroute
+repairs itself: if LID says Spanish and Whisper hears Tamil, the turn is Tamil
+from here on and TTS goes back to the local voice.
 
 Protocol (JSON lines on stdin/stdout):
     <- {"cmd": "init", "config": {...}}
@@ -36,12 +42,13 @@ import numpy as np
 # by name, so the shared routing tables are loaded by path — same as the LLM
 # worker does with the reply-language policy.
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from realtime.elevenlabs import ElevenLabs, ElevenLabsError, pcm16_to_wav  # noqa: E402
 from realtime.languages import (  # noqa: E402
     ROUTE_INTERNATIONAL,
     ROUTE_LOCAL,
     RouteGate,
     detect_language,
+    is_iso639_1,
+    iso639_1_for,
     language_from_code,
     route_for,
     script_of,
@@ -51,6 +58,10 @@ from realtime.languages import (  # noqa: E402
 # capture rate in realtime.yaml. Anything else would need resampling, and a
 # silently wrong rate makes LID confidently wrong rather than obviously broken.
 LID_SAMPLE_RATE = 16000
+
+# Whisper's feature extractor is also 16kHz-only, so the whole STT path shares
+# one rate and nothing on it ever resamples.
+WHISPER_SAMPLE_RATE = 16000
 
 
 def emit(obj):
@@ -79,7 +90,8 @@ def _load_lid(cfg, torch):
     model_dir = lid_cfg.get("model_dir")
     if not model_dir or not os.path.isdir(model_dir):
         return None, (f"model_dir {model_dir!r} not found — run "
-                      f"`bash download.sh --skip-venvs` to fetch it")
+                      f"`hf download facebook/mms-lid-126 --local-dir "
+                      f"{model_dir}` to fetch it")
 
     from transformers import AutoFeatureExtractor, Wav2Vec2ForSequenceClassification
 
@@ -135,26 +147,123 @@ def main():
     # LID needs a few seconds, not the whole turn; capping bounds the forward
     # pass so a 15s utterance costs the same as a 3s one.
     max_audio_s = float(lid_cfg.get("max_audio_s", 5.0))
-    # Above this the LID answer is passed to Scribe as a hint. Below it Scribe
-    # is left to detect on its own, since a confident wrong hint is worse than
-    # no hint at all.
+    # Above this the LID answer is passed to Whisper as a decoding hint. Below
+    # it Whisper is left to detect on its own, since a confident wrong hint is
+    # worse than no hint at all — Whisper forced into the wrong language does
+    # not fail, it translates.
     hint_confidence = float(lid_cfg.get("hint_confidence", 0.85))
 
-    # -- ElevenLabs -------------------------------------------------------
-    el_cfg = cfg.get("elevenlabs") or {}
-    api_key = os.environ.get(el_cfg.get("api_key_env", "ELEVENLABS_API_KEY"), "")
-    client = None
-    if el_cfg.get("enabled", True):
+    # -- Whisper large-v3, the Set B ear -----------------------------------
+    #
+    # Loaded on demand rather than at startup. It is 3.1 GB and Set A and Set B
+    # are never both needed for the same turn, so holding it beside SraVaani,
+    # Gemma and the local voice would cost a third of the card for a model most
+    # sessions never reach. The first international turn pays the load; every
+    # one after it is free.
+    #
+    # `enabled: false` (the suspended state) means never load it at all, and
+    # international turns are reported rather than transcribed — same contract
+    # the missing-key case had before.
+    wh_cfg = cfg.get("whisper") or {}
+    whisper_enabled = wh_cfg.get("enabled", True)
+    whisper_dir = wh_cfg.get("model_dir")
+    # The tuple is (processor, model, dtype) once loaded; the string is why it
+    # could not be. Both start empty — nothing is decided until a turn asks.
+    whisper = None
+    whisper_error = None
+    if not whisper_enabled:
+        whisper_error = "disabled in config"
+    elif not whisper_dir or not os.path.isdir(whisper_dir):
+        whisper_error = (f"model_dir {whisper_dir!r} not found — fetch "
+                         f"openai/whisper-large-v3 into it")
+
+    def _load_whisper():
+        """Load Whisper on first use. Returns (bundle, error); one is None.
+
+        Failures are sticky: a missing directory or an OOM will not fix itself
+        between utterances, and retrying the load on every foreign turn would
+        pay several seconds each time to reach the same answer.
+        """
+        nonlocal whisper, whisper_error
+        if whisper is not None or whisper_error is not None:
+            return whisper, whisper_error
+
+        from transformers import AutoProcessor, AutoModelForSpeechSeq2Seq
+
+        dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16,
+                 "float32": torch.float32}.get(wh_cfg.get("dtype", "float16"),
+                                               torch.float16)
+        t = time.time()
         try:
-            client = ElevenLabs(
-                api_key,
-                stt_model=el_cfg.get("stt_model"),
-                timeout_s=el_cfg.get("stt_timeout_s", el_cfg.get("timeout_s", 20)),
-                retries=el_cfg.get("retries", 1),
+            processor = AutoProcessor.from_pretrained(whisper_dir)
+            wmodel = AutoModelForSpeechSeq2Seq.from_pretrained(
+                whisper_dir, dtype=dtype, low_cpu_mem_usage=True,
             )
-        except ElevenLabsError as exc:
-            log(f"international speech-to-text unavailable ({exc}); "
-                f"international speech will be reported, not transcribed")
+            wmodel = wmodel.to(cfg.get("device", "cuda"))
+            wmodel.eval()
+        except Exception as exc:
+            whisper_error = repr(exc)
+            log(f"Whisper failed to load ({whisper_error}); international "
+                f"speech will be reported, not transcribed")
+            return None, whisper_error
+        whisper = (processor, wmodel, dtype)
+        log(f"Whisper large-v3 loaded in {time.time() - t:.1f}s "
+            f"({wh_cfg.get('dtype', 'float16')})")
+        return whisper, None
+
+    # Whisper's own language tags are ISO 639-1 ("es", "ta"), while LID speaks
+    # 639-3 ("spa", "tam"). Rather than carry a second table, the hint is
+    # resolved through the shared one in realtime/languages.py: code ->
+    # language name -> the 639-1 tag Whisper wants. A name with no 639-1 tag
+    # simply yields no hint, which is the safe direction.
+
+    def transcribe_whisper(wav, hint_code=None):
+        """One utterance -> {"text", "language"} using Whisper large-v3.
+
+        Whisper detects the language as part of decoding and reports it, which
+        is what the rest of the turn runs on. The LID hint is passed only when
+        LID was confident: forcing the wrong language makes Whisper *translate*
+        into it rather than refuse, which reads as a plausible but wrong
+        transcript.
+        """
+        bundle, err = _load_whisper()
+        if bundle is None:
+            raise RuntimeError(err or "whisper unavailable")
+        processor, wmodel, dtype = bundle
+
+        features = processor(
+            wav, sampling_rate=WHISPER_SAMPLE_RATE, return_tensors="pt",
+        ).input_features.to(wmodel.device, dtype)
+
+        kwargs = {"task": "transcribe"}
+        hint_lang = language_from_code(hint_code) if hint_code else None
+        iso1 = iso639_1_for(hint_lang) if hint_lang else None
+        if iso1:
+            kwargs["language"] = iso1
+
+        with torch.inference_mode():
+            ids = wmodel.generate(
+                features,
+                max_new_tokens=int(wh_cfg.get("max_new_tokens", 220)),
+                num_beams=int(wh_cfg.get("num_beams", 1)),
+                return_dict_in_generate=True,
+                **kwargs,
+            )
+        sequences = ids.sequences
+        text = processor.batch_decode(sequences, skip_special_tokens=True)[0]
+
+        # The language token is the one Whisper itself chose, emitted near the
+        # start of the sequence as `<|es|>`. Read it back rather than trusting
+        # the hint, since the whole point of this path is that Whisper's answer
+        # outranks LID's.
+        detected = None
+        for token in processor.tokenizer.convert_ids_to_tokens(sequences[0][:4]):
+            if token.startswith("<|") and token.endswith("|>"):
+                tag = token[2:-2]
+                if is_iso639_1(tag):
+                    detected = tag
+                    break
+        return {"text": text.strip(), "language_code": detected or iso1}
 
     # Which of MMS-LID's 126 labels the local ear can handle. Built once, from
     # the model's own label list, so it cannot drift from LOCAL_STT.
@@ -214,7 +323,11 @@ def main():
         "load_s": round(load_s, 2),
         "lid": lid is not None,
         "lid_error": lid_error,
-        "elevenlabs": client is not None,
+        # Whether the Set B ear *can* be loaded, not whether it is: the weights
+        # are on disk and enabled, so an international turn will get one. It is
+        # loaded on first use, so nothing is resident yet.
+        "international_stt": whisper_error is None,
+        "international_stt_error": whisper_error,
         "vram_gb": round(torch.cuda.memory_allocated() / 1024**3, 2)
         if torch.cuda.is_available() else 0.0,
     })
@@ -248,42 +361,39 @@ def main():
             lid_ms = int((time.time() - t_lid) * 1000)
 
             if route == ROUTE_INTERNATIONAL:
-                if client is None:
+                if whisper_error is not None:
                     # Transcribing it locally would produce Indic gibberish
                     # that reads as a working pipeline giving a strange answer.
                     # Naming the problem is the only honest option.
                     emit({"ok": False, "utt_id": req["utt_id"],
                           "error": "no_international_stt", "lang": lang,
+                          "reason": whisper_error,
                           "confidence": round(confidence, 3)})
                     continue
 
-                wav_bytes = pcm16_to_wav(
-                    (np.clip(wav, -1.0, 1.0) * 32767.0).astype("<i2").tobytes(),
-                    rate,
-                )
-                result = client.transcribe(
-                    wav_bytes,
-                    language_code=code if confidence >= hint_confidence else None,
+                result = transcribe_whisper(
+                    wav,
+                    hint_code=code if confidence >= hint_confidence else None,
                 )
                 text = result["text"]
-                # Scribe outranks LID: it heard the words, not just the accent.
+                # Whisper outranks LID: it heard the words, not just the accent.
                 heard = language_from_code(result.get("language_code")) or lang
 
-                # ...but not the transcript it just produced. Scribe misnames
-                # the language of short or noisy clips — reporting Korean or
+                # ...but not the transcript it just produced. Whisper misnames
+                # the language of short or noisy clips — reporting Welsh or
                 # Chinese for English speech — and that name is not cosmetic:
-                # it becomes "Reply ONLY in Korean" in the LLM's directive and
-                # a Korean voice at synthesis. The script of the text is the
+                # it becomes "Reply ONLY in Welsh" in the LLM's directive and
+                # a Welsh voice at synthesis. The script of the text is the
                 # one piece of evidence that cannot disagree with itself, so
                 # when the two conflict the text wins.
                 written = detect_language(text) if text.strip() else None
                 if written and written != heard:
-                    # Only override when the scripts genuinely differ. Scribe
+                    # Only override when the scripts genuinely differ. Whisper
                     # saying "hindi" for Marathi is a distinction the script
-                    # cannot make and should not be second-guessed on; Scribe
+                    # cannot make and should not be second-guessed on; Whisper
                     # saying "korean" over Latin text is.
                     if script_of(written) != script_of(heard):
-                        log(f"scribe said {heard!r} but the transcript is "
+                        log(f"whisper said {heard!r} but the transcript is "
                             f"{written!r}; trusting the script")
                         heard = written
                 gate.observe(heard)
@@ -294,9 +404,11 @@ def main():
                     "lang": heard,
                     "lang_code": result.get("language_code") or code,
                     "route": route_for(heard, stage="stt"),
-                    "backend": "elevenlabs",
-                    "confidence": round(
-                        float(result.get("probability") or confidence), 3),
+                    "backend": "whisper",
+                    # Whisper reports no per-utterance language probability, so
+                    # LID's confidence is what there is. It described the route,
+                    # not the transcript, which is the honest reading of it.
+                    "confidence": round(float(confidence), 3),
                     "lid_ms": lid_ms,
                     "elapsed_s": round(time.time() - t, 3),
                 })
@@ -320,10 +432,6 @@ def main():
                 "lid_ms": lid_ms,
                 "elapsed_s": round(time.time() - t, 3),
             })
-        except ElevenLabsError as exc:
-            log(f"international speech-to-text failed: {exc}")
-            emit({"ok": False, "utt_id": req.get("utt_id"),
-                  "error": f"international_stt: {exc}"})
         except Exception as exc:  # keep the worker alive across bad utterances
             log(f"transcribe failed: {exc!r}")
             emit({"ok": False, "utt_id": req.get("utt_id"), "error": str(exc)})

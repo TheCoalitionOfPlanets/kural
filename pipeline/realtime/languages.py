@@ -18,13 +18,13 @@ This module is also where the **stack routing** decision lives. The local
 models are Indic by construction — SraVaani hears Indian languages plus
 English, Indic-Mio speaks the 22 scheduled languages plus English — so a
 language outside that range has neither a local ear nor a local voice, and is
-served by ElevenLabs instead. `route_for()` is the one place that decision is
-made; STT, the LLM and TTS all consult it rather than each keeping their own
-list.
+served by the Set B models instead — Whisper large-v3 for the ear, MMS-TTS for
+the voice. `route_for()` is the one place that decision is made; STT, the LLM
+and TTS all consult it rather than each keeping their own list.
 
 The two local sets are *not* identical, which is why `route_for()` takes a
 `stage`. SraVaani's model card excludes Urdu and Kashmiri; Indic-Mio speaks
-both. So an Urdu turn is heard by Scribe and spoken by the local voice — each
+both. So an Urdu turn is heard by Whisper and spoken by the local voice — each
 stage using whichever model can actually do its half.
 
 Imported by workers running in three different venvs, so it stays stdlib-only.
@@ -57,9 +57,9 @@ _SCRIPT_RANGES = [
     # of it by its own letters — see _PERSO_ARABIC_URDU below.
     ("arabic", 0x0600, 0x06FF),
 
-    # -- non-Indic scripts, for the ElevenLabs path ------------------------
+    # -- non-Indic scripts, for the Set B path -----------------------------
     # These exist so a reply whose language was never established upstream
-    # (no LID answer, no Scribe answer) still routes somewhere sane instead of
+    # (no LID answer, no Whisper answer) still routes somewhere sane instead of
     # falling through to English and being read aloud by the wrong voice.
     ("russian", 0x0400, 0x04FF),    # Cyrillic; also Ukrainian and Bulgarian
     ("greek", 0x0370, 0x03FF),
@@ -163,8 +163,8 @@ SUPPORTED = frozenset({ENGLISH} | set(_ROMANIZED) | {n for n, _, _ in _SCRIPT_RA
 # Which stack owns which language. The local models are Indic by construction:
 # SraVaani hears the scheduled Indian languages plus English, Indic-Mio speaks
 # the same set from one set of weights. Everything else — Spanish, Russian,
-# Japanese, Arabic — has no local ear and no local voice, so both STT and TTS
-# for it are served by ElevenLabs.
+# Japanese, Arabic — has no Set A ear and no Set A voice, so both STT and TTS
+# for it are served by Set B: Whisper large-v3 and MMS-TTS.
 #
 # The set below is therefore the definition of "handled locally", and its
 # complement is the definition of "international". There is no separate list of
@@ -195,7 +195,7 @@ LOCAL_TTS = frozenset({
 # Neither appears in its evaluation tables. So both are removed from the STT
 # side while staying on the TTS side, which speaks them fine.
 #
-# The practical effect is that an Urdu turn is *heard* by Scribe and *spoken*
+# The practical effect is that an Urdu turn is *heard* by Whisper and *spoken*
 # by Indic-Mio — each stage independently using whichever model can do the job.
 LOCAL_STT = LOCAL_TTS - {"urdu", "kashmiri"}
 
@@ -205,21 +205,72 @@ LOCAL_STT = LOCAL_TTS - {"urdu", "kashmiri"}
 # detail than that.
 LOCAL = LOCAL_STT & LOCAL_TTS
 
-# What ElevenLabs' multilingual TTS actually speaks. Scribe hears far more
-# languages than this, so a turn can be transcribed perfectly and still have no
-# voice — Sinhala and Vietnamese are the common cases. Those get the same
-# text-only treatment the local stack already gives a missing voice, rather
-# than being read aloud by a model guessing at the script.
-ELEVEN_TTS_LANGUAGES = frozenset({
-    "english", "japanese", "chinese", "german", "hindi", "french", "korean",
-    "portuguese", "italian", "spanish", "indonesian", "dutch", "turkish",
-    "filipino", "polish", "swedish", "bulgarian", "romanian", "arabic",
-    "czech", "greek", "finnish", "croatian", "malay", "slovak", "danish",
-    "tamil", "ukrainian", "russian",
-})
+# MMS-TTS is not one model but a family: Meta ships a separate VITS checkpoint
+# per language, each ~145 MB, named by ISO 639-3 code (`facebook/mms-tts-spa`).
+# So the international voice is a *map* from this pipeline's language names to
+# the checkpoint that speaks them, not a bare set — the worker needs the code
+# to know which directory to load.
+#
+# Whisper hears far more languages than are listed here, so a turn can be
+# transcribed perfectly and still have no voice. Those get the same text-only
+# treatment the local stack already gives a missing voice, rather than being
+# read aloud by a model guessing at the script.
+#
+# Two of MMS's codes are not the ones the rest of this file uses, and both are
+# easy to get wrong:
+#
+#   chinese    `cmn` — MMS has no `zho`; the Mandarin checkpoint is the one.
+#   filipino   `tgl` — shipped under Tagalog, which is what Filipino is.
+#
+# MMS covers over a thousand languages; this is deliberately only the Set B
+# list from the README plus the ones Whisper commonly reports. Adding a
+# language is one line here plus its checkpoint on disk.
+MMS_TTS_VOICES = {
+    "arabic": "ara",
+    "bulgarian": "bul",
+    "chinese": "cmn",
+    "croatian": "hrv",
+    "czech": "ces",
+    "danish": "dan",
+    "dutch": "nld",
+    "english": "eng",
+    "filipino": "tgl",
+    "finnish": "fin",
+    "french": "fra",
+    "german": "deu",
+    "greek": "ell",
+    "indonesian": "ind",
+    "italian": "ita",
+    "japanese": "jpn",
+    "korean": "kor",
+    "malay": "zlm",
+    "polish": "pol",
+    "portuguese": "por",
+    "romanian": "ron",
+    "russian": "rus",
+    "slovak": "slk",
+    "spanish": "spa",
+    "swedish": "swe",
+    "turkish": "tur",
+    "ukrainian": "ukr",
+    # Beyond Set B, but MMS ships them and Whisper reports them often enough
+    # that the alternative is a silent reply.
+    "vietnamese": "vie",
+    "thai": "tha",
+    "hebrew": "heb",
+    "hungarian": "hun",
+    "persian": "fas",
+    "swahili": "swh",
+    "afrikaans": "afr",
+    "sinhala": "sin",
+    "norwegian": "nob",
+}
 
-# ISO 639-3, because that is what the LID model emits and what ElevenLabs'
-# speech-to-text accepts as a hint. Only the mapping to this pipeline's own
+# Kept as a set for the callers that only ask "can this be spoken at all".
+MMS_TTS_LANGUAGES = frozenset(MMS_TTS_VOICES)
+
+# ISO 639-3, because that is what the LID model emits and what names the
+# MMS-TTS checkpoints. Only the mapping to this pipeline's own
 # language names is needed; unmapped codes are handled by name-from-code
 # returning the bare code, which still routes correctly (it is not in LOCAL).
 _ISO639_3 = {
@@ -249,9 +300,9 @@ _ISO639_3 = {
     "pes": "persian", "per": "persian", "swa": "swahili", "afr": "afrikaans",
 }
 
-# ISO 639-1 is what most of the world's language tags look like, and Scribe
-# accepts either. Two-letter codes are folded in so a code arriving from
-# somewhere other than the LID model still resolves.
+# ISO 639-1 is what most of the world's language tags look like, and Whisper
+# reports its detected language as one. Two-letter codes are folded in so a
+# code arriving from somewhere other than the LID model still resolves.
 _ISO639_1 = {
     "en": ENGLISH, "hi": "hindi", "bn": "bengali", "mr": "marathi",
     "te": "telugu", "kn": "kannada", "ta": "tamil", "ml": "malayalam",
@@ -268,6 +319,14 @@ _ISO639_1 = {
     "he": "hebrew", "hu": "hungarian", "no": "norwegian", "fa": "persian",
     "sw": "swahili", "af": "afrikaans",
 }
+
+# Name -> two-letter tag. Built by inverting the table above rather than
+# written out, so a code added there is automatically available in both
+# directions. First tag wins where a language has several ("no"/"nb"), which is
+# fine — any of them names the same language.
+_ISO639_1_INVERSE = {}
+for _code, _name in _ISO639_1.items():
+    _ISO639_1_INVERSE.setdefault(_name, _code)
 
 # Languages written in Latin script. The reply directive tells the model to use
 # the language's *native* script, which is right for Tamil and Japanese and
@@ -304,6 +363,24 @@ _SCRIPTS.update({
 })
 
 
+def iso639_1_for(lang):
+    """This pipeline's language name -> its ISO 639-1 tag, or None.
+
+    The inverse of the `_ISO639_1` table, which is the direction Whisper needs:
+    it takes and reports two-letter tags, while the LID model emits three-letter
+    ones. Keeping one table and inverting it here is what stops the two from
+    drifting apart. A language with no two-letter tag yields None, which callers
+    treat as "no hint" — the safe direction.
+    """
+    name = str(lang or "").strip().lower()
+    return _ISO639_1_INVERSE.get(name)
+
+
+def is_iso639_1(tag):
+    """Whether a bare tag is one of the two-letter codes this module knows."""
+    return str(tag or "").strip().lower() in _ISO639_1
+
+
 def script_of(lang):
     """The writing system a language uses, or None if unknown.
 
@@ -319,9 +396,9 @@ def language_from_code(code):
     """ISO 639-1/639-3 -> this pipeline's language name.
 
     An unknown code is returned as-is rather than dropped. It will not be in
-    LOCAL, so it routes to ElevenLabs — which is the right answer for a
-    language nobody here has heard of, and better than silently calling it
-    English and handing it to a stack that cannot say it.
+    LOCAL, so it routes to Set B — which is the right answer for a language
+    nobody here has heard of, and better than silently calling it English and
+    handing it to a stack that cannot say it.
     """
     if not code:
         return None
@@ -344,12 +421,12 @@ def route_for(lang, stage=None):
     because the two local models do not cover the same languages — SraVaani
     cannot hear Urdu or Kashmiri, Indic-Mio speaks both — so a single answer
     would either send Urdu to an ear that cannot hear it or send its reply to
-    ElevenLabs when a local voice was available.
+    MMS-TTS when a local voice was available.
 
     The default is local: a turn whose language was never established is
     overwhelmingly English or Indic here, and guessing local costs a bad
-    transcript while guessing international costs an API call on every
-    ambiguous turn.
+    transcript while guessing international costs a model load and a slower
+    turn on every ambiguous one.
     """
     if not lang:
         return ROUTE_LOCAL
@@ -362,9 +439,19 @@ def is_international(lang):
     return route_for(lang) == ROUTE_INTERNATIONAL
 
 
-def has_eleven_voice(lang):
-    """Whether ElevenLabs' multilingual TTS can speak this language."""
-    return str(lang or "").strip().lower() in ELEVEN_TTS_LANGUAGES
+def mms_voice_code(lang):
+    """The MMS-TTS checkpoint code for a language, or None if it has no voice.
+
+    Returned rather than a bool because the caller needs the code anyway: the
+    checkpoints are per-language directories (`mms-tts-spa`), so knowing that a
+    voice exists and knowing which one to load are the same question.
+    """
+    return MMS_TTS_VOICES.get(str(lang or "").strip().lower())
+
+
+def has_mms_voice(lang):
+    """Whether MMS-TTS ships a checkpoint for this language."""
+    return mms_voice_code(lang) is not None
 
 
 class RouteGate:
@@ -377,8 +464,8 @@ class RouteGate:
     about. The worker owns the forward pass; this owns what to do with it.
 
     Every default leans local. A wrong local route costs one bad transcript; a
-    wrong international route costs an API call, and on a mostly-Indic pipeline
-    the ambiguous turns are mostly Indic.
+    wrong international route costs loading a 1.55B model and a slower turn,
+    and on a mostly-Indic pipeline the ambiguous turns are mostly Indic.
     """
 
     def __init__(self, min_confidence=0.55, min_audio_s=0.7, sticky_ttl_s=60.0,
@@ -387,9 +474,9 @@ class RouteGate:
         self.min_audio_s = float(min_audio_s)
         self.sticky_ttl_s = float(sticky_ttl_s)
         # Deliberately well below half. The question is not "is this definitely
-        # a local language" but "is there real reason to spend an API call", and
-        # 111 of 126 labels vote to leave — so a third of the mass staying home
-        # is already strong evidence against a foreign turn. English and Indic
+        # a local language" but "is there real reason to leave the local
+        # stack", and 111 of 126 labels vote to leave — so a third of the mass
+        # staying home is already strong evidence against a foreign turn. English and Indic
         # speech that LID is merely unsure about clears this comfortably; actual
         # Spanish or Chinese does not come close.
         self.min_local_mass = float(min_local_mass)
@@ -430,7 +517,7 @@ class RouteGate:
         `cym` and `nno` can top out on a foreign label and be sent abroad even
         though local was the right answer by a wide margin. Summing per route
         instead of trusting the argmax is what stops one confident-looking
-        wrong label from spending an API call on English.
+        wrong label from sending English to the Set B stack.
         """
         if not lang or not self.should_identify(duration_s):
             return ROUTE_LOCAL, None
@@ -460,8 +547,8 @@ class RouteGate:
         """Record what the turn actually turned out to be.
 
         Called with the *final* language, which on the international path comes
-        from Scribe rather than from LID — so the window tracks what was really
-        being spoken, not what was guessed before transcription.
+        from Whisper rather than from LID — so the window tracks what was
+        really being spoken, not what was guessed before transcription.
 
         `None` means nothing was established, and leaves the window alone. That
         distinction is the difference between hysteresis that works and

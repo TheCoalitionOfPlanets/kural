@@ -37,8 +37,7 @@ NEXT_PUBLIC_PIPELINE_URL=http://127.0.0.1:8000
 ### Without a GPU
 
 `pipeline/tests/stub_server.py` is the same server with the three models faked
-out. It needs no weights, no GPU and no ElevenLabs key, and is the right way to
-work on the UI:
+out. It needs no weights and no GPU, and is the right way to work on the UI:
 
 ```bash
 python3 ../pipeline/tests/stub_server.py    # port 8123

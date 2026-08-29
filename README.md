@@ -96,6 +96,10 @@ directly in one small forward pass, about **90 ms**. Its answer picks the stack:
 | one of the 23 Set A languages | SraVaani | Indic-Mio |
 | one of the 26 Set B languages | Whisper large-v3 | MMS-TTS |
 
+Both Set B models are **loaded on demand** rather than held resident: Set A and
+Set B are never both needed for the same turn, so the first turn that routes
+abroad pays the load and every one after it is free.
+
 ### Routing by mass, not by label
 
 The router has 126 possible labels, and only 15 of them are languages the local
@@ -268,6 +272,11 @@ VITS-based synthesis model from Meta's Massively Multilingual Speech project.
 It ships a compact per-language checkpoint (~145 MB) for over
 a thousand languages, so only the ones actually in use need to be resident.
 
+Each checkpoint carries one fixed speaker, and there is no cloning: the Set B
+voice is a different person from the local one, and a language switch is
+audible as a speaker switch. That is the cost of keeping synthesis local and
+small.
+
 VITS is non-autoregressive, which matters here: it synthesises in roughly
 constant time rather than token by token, so a long reply in Set B does not cost
 proportionally more latency the way an autoregressive voice does.
@@ -298,9 +307,9 @@ So routing is answered **per stage**, not once per turn:
 * the **voice** asks which model should speak this reply
 
 **Urdu and Kashmiri** are the case that forces the split. SraVaani cannot hear
-them, Indic-Mio speaks them fluently — so they are transcribed by the
-Whisper and spoken by Indic-Mio. Any single shared list
-would have broken one half or the other.
+them, Indic-Mio speaks them fluently — so they are transcribed by Whisper and
+spoken by Indic-Mio. Any single shared list would have broken one half or the
+other.
 
 The voice is also chosen from the *reply's* language, not from the route the
 user's audio took. They usually agree; when they do not, the reply is what is

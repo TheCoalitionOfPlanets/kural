@@ -1,18 +1,21 @@
 """Always-listening speech -> reasoning -> speech pipeline.
 
     mic -> VAD -> [LID] -> [SraVaani STT ] -> [Gemma 3 4B] -> [Indic-Mio  ] -> speaker
-                           [ElevenLabs   ]                    [ElevenLabs ]
+                           [Whisper lg-v3]                    [MMS-TTS    ]
 
 Each model runs as a subprocess in its own venv (their transformers pins are
 mutually incompatible); this process owns capture, the queues, scheduling and
 playback.
 
-The two ears and the two voices are chosen per utterance. The local models are
-Indic by construction, so a turn in Spanish or Japanese is heard and spoken by
-ElevenLabs instead — decided from the waveform by the language-ID gate in the
-STT worker, and from the reply's language at TTS. Everything downstream of
-that choice is identical: one WAV, one player, the same VAD gate, echo guard
-and barge-in.
+The two ears and the two voices are chosen per utterance. The Set A models are
+Indic by construction, so a turn in Spanish or Japanese is heard by Whisper
+large-v3 and spoken by MMS-TTS instead — decided from the waveform by the
+language-ID gate in the STT worker, and from the reply's language at TTS.
+Everything downstream of that choice is identical: one WAV, one player, the
+same VAD gate, echo guard and barge-in.
+
+Every model is local. The Set B pair is loaded on demand rather than held
+resident, since Set A and Set B are never both needed for the same turn.
 
     python pipeline/run_realtime.py
     python pipeline/run_realtime.py --config pipeline/config/realtime.yaml
@@ -20,7 +23,6 @@ and barge-in.
 """
 import argparse
 import queue
-import re
 import signal
 import sys
 import threading
@@ -173,14 +175,17 @@ def main():
         # The international path is optional and fails soft — the pipeline runs
         # without it, just local-only. That has to be visible here rather than
         # discovered halfway through a Spanish sentence, so both halves report
-        # whether they actually came up.
+        # whether they will be there when a turn needs them. They are loaded on
+        # demand, so this reports whether they *can* load, not that they have.
         if info.get("lid") is False:
             print(f"    ! language ID off ({info.get('lid_error') or 'disabled'})"
                   f" — every turn routes to the local Indic models", flush=True)
-        if info.get("elevenlabs") is False:
-            missing = "transcribe" if label == "stt" else "speak"
-            print(f"    ! international {label} off — cannot {missing} "
-                  f"languages outside the local set", flush=True)
+        for cap, verb in (("international_stt", "transcribe"),
+                          ("international_tts", "speak")):
+            if info.get(cap) is False:
+                why = info.get(f"{cap}_error") or "disabled"
+                print(f"    ! international {label} off ({why}) — cannot "
+                      f"{verb} languages outside the local set", flush=True)
 
     def on_stage(kind, **kw):
         utt = kw.get("utt_id", "")
@@ -189,15 +194,15 @@ def main():
             # every line would be noise; a tag on the international ones is the
             # only visible sign that a paid call was made.
             tag = ""
-            if kw.get("backend") == "elevenlabs":
-                tag = f" ({kw.get('lang') or 'international'} via remote)"
+            if kw.get("backend") == "whisper":
+                tag = f" ({kw.get('lang') or 'international'} via Whisper)"
             console.line(f"[{utt}] heard{tag}: {kw['text']}")
         elif kind == "llm":
             lang = kw.get("lang")
             tag = f" ({lang})" if lang else ""
             console.line(f"[{utt}] reply{tag}: {kw['text']}")
         elif kind == "tts":
-            tag = " via remote" if kw.get("backend") == "elevenlabs" else ""
+            tag = " via MMS-TTS" if kw.get("backend") == "mms-tts" else ""
             console.line(f"[{utt}] synth {kw.get('audio_s')}s "
                          f"in {kw.get('elapsed_s')}s{tag}")
         elif kind == "latency":
@@ -209,12 +214,13 @@ def main():
         elif kind == "stt_empty":
             console.line(f"[{utt}] no speech recognized")
         elif kind == "stt_no_international":
-            # Identified as a language the local ear cannot hear, with nowhere
-            # to send it. Transcribing it locally anyway would return confident
-            # gibberish, so the turn is dropped and the reason named.
+            # Identified as a language the Set A ear cannot hear, with the
+            # Set B ear unavailable. Transcribing it with SraVaani anyway would
+            # return confident gibberish, so the turn is dropped and the reason
+            # named.
             console.line(
                 f"[{utt}] ! {kw.get('lang') or 'international'} speech, but "
-                f"the international path is not configured — turn dropped."
+                f"the international ear is unavailable — turn dropped."
             )
         elif kind == "echo_dropped":
             console.line(f"[{utt}] echo of own output, dropped: {kw['text']}")
@@ -245,24 +251,11 @@ def main():
         elif kind.endswith("_failed") or kind == "stage_error":
             console.line(f"  ! {kind}: {kw.get('error')}")
 
-    # Worker stderr is forwarded verbatim, so anything the vendor SDK, an HTTP
-    # error or a traceback happens to say reaches the terminal unedited — the
-    # API host, the exception class, the module path. The console names
-    # capabilities ("international speech-to-text"), never the provider, so
-    # this is the one choke point where that guarantee can actually be kept:
-    # every child line passes through here on its way to the screen.
-    _VENDOR_RE = re.compile(
-        r"api\.elevenlabs\.io|elevenlabs\.io|ElevenLabsError|ElevenLabs|"
-        r"eleven_multilingual\w*|eleven_\w+|elevenlabs|ELEVENLABS\w*",
-        re.IGNORECASE,
-    )
-
-    def _scrub(text):
-        """Replace any mention of the international provider with its role."""
-        return _VENDOR_RE.sub("international-tts-provider", text)
-
+    # Worker stderr is forwarded verbatim. Every stage is a local model now, so
+    # there is nothing to redact on the way to the screen — a traceback naming
+    # a module path or a checkpoint is exactly what someone debugging wants.
     def on_worker_log(name, line):
-        console.line(f"  [{name}] {_scrub(line)}")
+        console.line(f"  [{name}] {line}")
 
     # -- capture-only mode (build order step 1) ----------------------------
 

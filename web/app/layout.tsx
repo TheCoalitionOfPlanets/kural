@@ -5,8 +5,8 @@ import "./globals.css";
 export const metadata: Metadata = {
   title: "Kural — Voice",
   description:
-    "Always-listening speech pipeline. Indian languages run on local models; " +
-    "everything else is routed to ElevenLabs.",
+    "Always-listening speech pipeline. Indian languages run on models tuned " +
+    "for them; everything else on Whisper and MMS-TTS. All of it local.",
 };
 
 export const viewport: Viewport = {

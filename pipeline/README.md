@@ -5,12 +5,14 @@ Always-listening voice loop:
 ```
                         ┌ SraVaani STT ┐                ┌ Indic-Mio TTS ┐
 mic → VAD → language ID ┤              ├→ Gemma 3 4B →  ┤               ├→ speaker
-                        └ ElevenLabs   ┘                └ ElevenLabs    ┘
+                        └ Whisper lg-v3┘                └ MMS-TTS       ┘
 ```
 
-The local models are Indic: they hear and speak the 22 scheduled Indian
+The Set A models are Indic: they hear and speak the 22 scheduled Indian
 languages plus English. Anything else — Spanish, Russian, Japanese — is routed
-to ElevenLabs, per utterance, decided from the waveform before transcription.
+to Set B (Whisper large-v3 and MMS-TTS), per utterance, decided from the
+waveform before transcription. Every model is local; the Set B pair is loaded
+on demand rather than held resident.
 See [Reply language](#reply-language) and
 [docs/internationalLanguages.md](../docs/internationalLanguages.md).
 
@@ -79,7 +81,7 @@ All three models stay resident on one 12 GB card:
 LLM, not a per-voice file loaded lazily on CPU — the exact figure is reported
 in the `tts` worker's `ready` event (`vram_gb`) at startup.
 
-† The language gate that routes international turns to ElevenLabs. Optional:
+† The language gate that routes international turns to Set B. Optional:
 set `stt.lid.enabled: false` (or skip the download) to reclaim it and route
 every turn locally. `stt.lid.dtype: float16` halves it if VRAM is tight.
 
@@ -221,16 +223,17 @@ Spanish, in a Spanish voice.
 The local models cannot do this and never will: SraVaani hears the scheduled
 Indian languages plus English, Indic-Mio speaks the same set. So that set is
 "local" and its complement is "international", and international turns are
-served by ElevenLabs — Scribe for the ear, `eleven_multilingual_v2` for the
-voice. `route_for()` in [languages.py](realtime/languages.py) is the single
-place that decision is made.
+served by Set B — Whisper large-v3 for the ear, MMS-TTS for the voice.
+`route_for()` in [languages.py](realtime/languages.py) is the single place that
+decision is made.
 
-> **Currently suspended.** `stt.lid.enabled` and `elevenlabs.enabled` are both
-> `false` in [realtime.yaml](config/realtime.yaml), so none of this path is
-> live: every turn is heard by SraVaani and spoken by Indic-Mio, and nothing
-> leaves the machine. A reply in a language the local voice cannot speak is
-> printed as text rather than spoken. The section below describes the design,
-> which is unchanged and returns by setting both flags back to `true`.
+> **Currently suspended.** `stt.lid.enabled`, `stt.whisper.enabled` and
+> `tts.mms_tts.enabled` are all `false` in
+> [realtime.yaml](config/realtime.yaml), so none of this path is live: every
+> turn is heard by SraVaani and spoken by Indic-Mio. A reply in a language the
+> local voice cannot speak is printed as text rather than spoken. The section
+> below describes the design, which is unchanged and returns by setting the
+> three flags back to `true`.
 
 The hard part is *knowing*. Handed Spanish, SraVaani does not fail — it returns
 confident Devanagari gibberish — so the transcript cannot reveal that it should
@@ -242,7 +245,7 @@ transcription:
 audio ─▶│  MMS-LID 126 │────────────────────▶│  SraVaani    │─▶ transcript
         │  (one pass)  │                     └──────────────┘
         └───────┬──────┘   anything else     ┌──────────────┐
-                └────────────────────────────▶│  Scribe      │─▶ transcript
+                └────────────────────────────▶│  Whisper l-v3│─▶ transcript
                                              └──────────────┘
 ```
 
@@ -255,32 +258,29 @@ Four details do the real work:
 
 - **Failing toward local.** Below `stt.lid.min_confidence` the gate declines to
   commit and the turn stays local. A wrong local route costs one bad
-  transcript; a wrong international route costs an API call, and on a
-  mostly-Indic pipeline the ambiguous turns are mostly Indic.
+  transcript; a wrong international route costs loading a 1.55B model and a
+  slower turn, and on a mostly-Indic pipeline the ambiguous turns are mostly
+  Indic.
 - **Hysteresis that only confirms.** A conversation in Spanish survives one
   mumbled sentence (`stt.lid.sticky_ttl_s`), but a *confident* Tamil prediction
   wins immediately — switching back to an Indian language lands on the very
   next sentence, never after a delay.
-- **Scribe outranks LID.** LID picks the route; Scribe heard the words, so its
-  language is what the turn runs on. A misroute repairs itself: LID says
-  Spanish, Scribe says Tamil, and TTS goes straight back to the local voice.
+- **Whisper outranks LID.** LID picks the route; Whisper heard the words, so
+  its language is what the turn runs on. A misroute repairs itself: LID says
+  Spanish, Whisper hears Tamil, and TTS goes straight back to the local voice.
 - **The voice is chosen by the reply, not the route.** TTS calls `route_for()`
   on the reply's language, so the two halves cannot disagree.
 
 Both halves fail soft. Without the LID weights every turn routes locally, as it
-did before this existed; without `$ELEVENLABS_API_KEY` international turns are
+did before this existed; without the Whisper weights international turns are
 reported rather than transcribed into gibberish. Either way Indic and English
 are untouched, and both are stated at startup rather than discovered mid-
 sentence.
 
-```bash
-export ELEVENLABS_API_KEY=sk_xxx
-```
-
-Scribe hears more languages than the multilingual voice speaks — Sinhala,
-Vietnamese, Thai, Hebrew, Hungarian, Norwegian, Persian, Swahili, Afrikaans.
-Those get the existing text-only treatment: the reply is printed, not
-mispronounced. Full design in
+Whisper hears more languages than there are MMS-TTS checkpoints configured for
+in `MMS_TTS_VOICES`. Those get the existing text-only treatment: the reply is
+printed, not mispronounced. Adding one is a line in that table plus its
+checkpoint on disk. Full design in
 [docs/internationalLanguages.md](../docs/internationalLanguages.md).
 
 Unlike Piper, TTS is not a per-language voice file: Indic-Mio is a single
@@ -298,8 +298,19 @@ the worker returns `{"ok": false, "error": "no_voice"}` and the orchestrator
 prints the reply as text instead, rather than reading it aloud in the wrong
 language.
 
-Run `bash download.sh --skip-venvs` (or a full `bash download.sh`) to fetch
-the model and codec weights into `tts/models/`.
+Fetch the model and codec weights into `tts/models/` with the Hugging Face
+CLI:
+
+```bash
+hf download Aratako/Indic-Mio            --local-dir tts/models/Indic-Mio
+hf download Aratako/MioCodec-25Hz-24kHz  --local-dir tts/models/MioCodec-25Hz-24kHz
+```
+
+The Set B voices are per-language and only the ones in use are needed:
+
+```bash
+hf download facebook/mms-tts-spa --local-dir tts/models/mms-tts/spa
+```
 
 ## Tuning
 
@@ -332,13 +343,15 @@ onset is prepended so the leading phoneme survives.
 
 **Spanish (or Russian, or Japanese) comes out as Indic gibberish** — the LID
 gate did not fire. Check the startup line: if it says language ID is off, the
-weights are missing (`bash download.sh --skip-venvs`). Otherwise lower
+weights are missing (`hf download facebook/mms-lid-126 --local-dir
+stt/models/mms-lid-126`). Otherwise lower
 `stt.lid.min_confidence` toward `0.4`, or raise `stt.lid.min_audio_s` if the
 turns are short.
 
-**Indic turns are being sent to ElevenLabs** — raise `stt.lid.min_confidence`
-toward `0.7`. Every international route is a paid call, and the `heard (… via
-elevenlabs)` tag on the transcript line is how you spot them.
+**Indic turns are being routed to Set B** — raise `stt.lid.min_confidence`
+toward `0.7`. Every international route loads a 1.55B model and slows the turn,
+and the `heard (… via Whisper)` tag on the transcript line is how you spot
+them.
 
 **International replies cut themselves off** — the same fix as any other
 self-interrupt, since both voices share the normalizer: lower
@@ -358,16 +371,15 @@ pipeline/
 │   ├── workers.py         stage threads: STT → LLM → TTS → playback
 │   ├── echo_guard.py      text-level self-hearing and re-fed-input detection
 │   ├── languages.py       language detection, stack routing, reply directive
-│   ├── elevenlabs.py      stdlib-only HTTP client for the international path
 │   ├── speakable.py       strips what a TTS voice cannot say
 │   └── audio_out.py       blocking, strictly serial playback
 ├── realtime/
 │   ├── session.py         the one wiring both front ends share
 │   └── web_player.py      playback in a browser, behind Player's interface
 ├── workers/
-│   ├── worker_stt.py      runs in venv/ — SraVaani + the LID gate + Scribe
+│   ├── worker_stt.py      runs in venv/ — SraVaani + the LID gate + Whisper
 │   ├── worker_llm.py      runs in reasoning/venv/
-│   └── worker_tts.py      runs in tts/venv/ — Indic-Mio + the ElevenLabs voice
+│   └── worker_tts.py      runs in tts/venv/ — Indic-Mio + the MMS-TTS voice
 ├── server/app.py          WebSocket front end for web/
 ├── tests/                 run each file directly with venv's python
 │   └── stub_server.py     the server with the models faked — no GPU needed

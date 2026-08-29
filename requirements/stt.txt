@@ -2,7 +2,7 @@
 # SraVaani STT worker. Pins frozen from the working environment.
 #
 # torch/torchvision are NOT listed here: they are cu132 wheels that only exist
-# on the PyTorch CUDA index, and download.sh installs them separately.
+# on the PyTorch CUDA index, and are installed separately.
 transformers==5.15.0
 tokenizers==0.22.2
 huggingface_hub==1.28.0
@@ -11,10 +11,11 @@ safetensors==0.8.0
 sentencepiece==0.2.2
 numpy==2.5.2
 
-# The language gate (facebook/mms-lid-126) and the ElevenLabs client add no
-# pins of their own: MMS-LID is a plain transformers Wav2Vec2 classifier, and
-# realtime/elevenlabs.py posts over stdlib urllib rather than pulling `requests`
-# into all three venvs to send one form.
+# The language gate (facebook/mms-lid-126) and the Set B ear (Whisper large-v3)
+# add no pins of their own: MMS-LID is a plain transformers Wav2Vec2 classifier
+# and Whisper a plain transformers speech-seq2seq, both already covered by the
+# transformers pin above. Whisper is loaded on demand rather than at startup —
+# see stt.whisper in pipeline/config/realtime.yaml.
 
 # Orchestrator: capture, playback, config, VAD.
 sounddevice==0.5.6

@@ -52,17 +52,17 @@ stt:
   # waveform, before transcription, which is what this is: one small forward
   # pass that picks the ear.
   #
-  #   indic / english  ->  SraVaani, locally, free
-  #   anything else    ->  ElevenLabs Scribe (see the elevenlabs section)
+  #   indic / english  ->  SraVaani          (Set A, resident)
+  #   anything else    ->  Whisper large-v3  (Set B, see the whisper section)
   #
   # With the model missing or enabled: false, every turn routes locally and the
   # pipeline behaves exactly as it did before this path existed.
   lid:
     # SUSPENDED. The audio-level language router is off: every turn is heard by
     # the local Indic ear (SraVaani), whatever language was actually spoken.
-    # Nothing is sent to ElevenLabs Scribe. The weights and every knob below
-    # are left in place so this is a one-line revert — set `enabled: true` to
-    # bring the router back exactly as it was.
+    # Whisper is never reached, so it is never loaded. The weights and every
+    # knob below are left in place so this is a one-line revert — set
+    # `enabled: true` to bring the router back exactly as it was.
     enabled: false
     model_dir: stt/models/mms-lid-126
     # mms-lid-126 is a 966M-parameter wav2vec2 — bigger than the ASR it gates
@@ -74,9 +74,10 @@ stt:
     dtype: float16
     # Below this the prediction is not trusted and the turn stays local.
     # Failing toward local is deliberate: a wrong local route costs one bad
-    # transcript, a wrong international route costs an API call — and on a
-    # mostly-Indic pipeline the ambiguous turns are mostly Indic. Raise it to
-    # spend less; lower it if international speech is being missed.
+    # transcript, a wrong international route costs loading a 1.55B model and a
+    # slower turn — and on a mostly-Indic pipeline the ambiguous turns are
+    # mostly Indic. Raise it to stay local more often; lower it if
+    # international speech is being missed.
     min_confidence: 0.55
     # The main defence against English being sent abroad. Only 15 of MMS-LID's
     # 126 labels are local, so the top-1 label is structurally biased toward
@@ -86,8 +87,9 @@ stt:
     # when that total clears the bar, whatever the argmax said.
     #
     # Well below half on purpose — the question is not "is this certainly a
-    # local language" but "is there real reason to spend an API call". Raise it
-    # if foreign speech is being kept local; lower it if English still leaves.
+    # local language" but "is there real reason to leave the local stack".
+    # Raise it if foreign speech is being kept local; lower it if English
+    # still leaves.
     min_local_mass: 0.30
     # LID on a fragment is a coin flip, and short turns ("yes", "mm", "wait")
     # are overwhelmingly in the language already being spoken.
@@ -102,11 +104,37 @@ stt:
     # confident one, so switching back to Tamil still takes effect on the very
     # next sentence. 0 disables it.
     sticky_ttl_s: 60
-    # Above this, the detected language is passed to Scribe as a hint. Below
-    # it Scribe detects on its own, since a confident wrong hint is worse than
-    # none — and Scribe's answer is what the rest of the turn runs on either
-    # way.
+    # Above this, the detected language is passed to Whisper as a decoding
+    # hint. Below it Whisper detects on its own, since a confident wrong hint
+    # is worse than none — forced into the wrong language Whisper *translates*
+    # rather than failing. Whisper's answer is what the rest of the turn runs
+    # on either way.
     hint_confidence: 0.85
+
+  # -- Set B: Whisper large-v3 ---------------------------------------------
+  # The international ear. Local, like everything else here — there is no
+  # network on this path any more.
+  #
+  # Loaded on demand, not at startup: at 3.1 GB it does not belong on the card
+  # beside SraVaani, Gemma and the local voice, and Set A and Set B are never
+  # both needed for the same turn. The first turn that actually routes here
+  # pays the load; every one after it is free.
+  whisper:
+    # SUSPENDED alongside stt.lid — with the router off nothing ever routes
+    # here anyway, so this only makes that explicit. Set both to true together.
+    enabled: false
+    model_dir: stt/models/whisper-large-v3
+    # float16 halves the resident cost (3.1 GB rather than ~6.2) and Whisper is
+    # trained and released in half precision — this is the intended dtype, not
+    # a quantization trade.
+    dtype: float16
+    # Replies are capped at 96 tokens upstream, so a transcript never needs to
+    # be long. Bounding it also bounds the worst case: Whisper's known failure
+    # mode on silence is looping until it hits the cap.
+    max_new_tokens: 220
+    # Greedy. Beams would buy a little accuracy for a multiple of the latency,
+    # and this sits directly in the turn.
+    num_beams: 1
 
 llm:
   python: reasoning/venv/Scripts/python.exe
@@ -153,9 +181,10 @@ tts:
   # emotion-tagged or whispered audio is cloned faithfully, tone included, so
   # the reference should sound the way the assistant should sound.
   #
-  # This is also the file to upload to ElevenLabs Instant Voice Cloning — the
-  # same reference on both stacks is what keeps the local and international
-  # voices recognizably the same speaker. See docs/voice.md.
+  # This conditions the *local* voice only. MMS-TTS has one fixed speaker per
+  # language and no cloning, so the two stacks cannot be made to sound like the
+  # same person — a Set B reply is a different voice by construction. See
+  # docs/voice.md.
   reference_wav: tts/voice/reference.wav
   # Generation knobs, straight from the model card. Every extra token here is
   # also more synthesis latency, same as the LLM's max_new_tokens.
@@ -170,52 +199,40 @@ tts:
     target_lufs: -23.0     # null to disable; -16 is typical streaming loudness
     peak: 0.7              # hard ceiling after loudness normalization
 
-elevenlabs:
-  # The international ear and voice. Read by two workers — STT and TTS — from
-  # this one section, so the two halves of the path cannot drift apart.
+  # -- Set B: MMS-TTS (VITS) ------------------------------------------------
+  # The international voice. Meta's Massively Multilingual Speech synthesis
+  # model, one small VITS checkpoint per language (~145 MB each) rather than
+  # one multilingual model.
   #
-  # WHICH TURNS COME HERE is not configured: it is whatever the local models
-  # cannot handle. SraVaani hears the scheduled Indian languages plus English
-  # and Indic-Mio speaks the same set, so that set is "local" and its
-  # complement is "international" (pipeline/realtime/languages.py, LOCAL).
-  # Speak Tamil and nothing below is touched; speak Spanish and it all is.
+  # WHICH REPLIES COME HERE is not configured: it is whatever Indic-Mio cannot
+  # speak. Indic-Mio covers English plus the 22 scheduled Indian languages, so
+  # that set is "local" and its complement is "international"
+  # (pipeline/realtime/languages.py, LOCAL_TTS). Reply in Tamil and nothing
+  # below is touched; reply in Spanish and it all is.
   #
-  # SUSPENDED alongside `stt.lid`. Routing has two independent entry points --
-  # STT picks the ear from the audio, TTS picks the voice from the *reply's*
-  # language -- so turning the router off upstream does not by itself keep TTS
-  # home: an English-script reply the LLM produced in, say, Spanish would still
-  # have reached out. This closes the second door. A reply in a language the
-  # local voice cannot speak is now printed as text instead of spoken.
-  enabled: false
-  # The key is read from the environment, never from this file — config is
-  # committed, keys are not. Unset means the international path is unavailable,
-  # which is reported at startup and per-turn rather than failing silently.
-  api_key_env: ELEVENLABS_API_KEY
+  # Checkpoints are laid out under model_dir by ISO 639-3 code, matching the
+  # names Meta publishes them under:
+  #
+  #     tts/models/mms-tts/spa/     facebook/mms-tts-spa
+  #     tts/models/mms-tts/jpn/     facebook/mms-tts-jpn
+  #
+  # Loaded on first use and cached per language, so a session that stays in
+  # Tamil never loads one. `languages.MMS_TTS_VOICES` is the name -> code map;
+  # a language missing from it, or missing its directory, is reported as
+  # having no voice and the reply is printed as text.
+  mms_tts:
+    # SUSPENDED alongside stt.lid. Routing has two independent entry points --
+    # STT picks the ear from the audio, TTS picks the voice from the *reply's*
+    # language -- so turning the router off upstream does not by itself keep
+    # TTS home: a reply the LLM produced in, say, Spanish would still reach
+    # here. This closes the second door. A reply in a language the local voice
+    # cannot speak is printed as text instead of spoken.
+    enabled: false
+    model_dir: tts/models/mms-tts
+    # These are 36M-parameter models; float32 costs ~0.15 GB and half precision
+    # buys nothing worth the risk of a VITS numerical edge case.
+    dtype: float32
 
-  # Scribe is ElevenLabs' only speech-to-text model. It detects the language
-  # itself, and its answer outranks the local LID gate's — which is how a
-  # misrouted turn repairs itself: LID says Spanish, Scribe says Tamil, and the
-  # reply comes back in the local voice.
-  stt_model: scribe_v1
-
-  # eleven_multilingual_v2: 29 languages, the highest-quality tier. The
-  # flash/turbo v2.5 models cut roughly a second off each reply if the latency
-  # matters more than the voice does.
-  tts_model: eleven_multilingual_v2
-  voice_id: 21m00Tcm4TlvDq8ikWAM   # Rachel — a stock voice on every account
-  # Raw PCM, not MP3: nothing in this pipeline can decode a compressed stream,
-  # and the reply has to reach the loudness normalizer as samples. pcm_44100
-  # needs a Pro subscription; 24kHz is plenty for speech through one speaker.
-  output_format: pcm_24000
-  voice_settings:
-    stability: 0.5
-    similarity_boost: 0.75
-
-  # Every retry is silence the user is sitting through, so this is deliberately
-  # low. Only rate limits, 5xx and transport failures are retried — a bad key
-  # or a bad request returns the same answer however many times it is asked.
-  retries: 1
-  timeout_s: 20            # per call; stt_timeout_s / tts_timeout_s override
 
 barge_in:
   # Let the user interrupt a reply in progress. Requires echo.guard: the mic

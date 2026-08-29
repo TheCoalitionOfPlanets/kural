@@ -115,9 +115,9 @@ class STTStage(_Stage):
 
             if not res.get("ok"):
                 if res.get("error") == "no_international_stt":
-                    # Heard, identified, and then nowhere to send it. Reported
-                    # on its own because the fix is a config one — an API key —
-                    # not something wrong with the audio or the model.
+                    # Heard, identified, and then no ear that can transcribe
+                    # it. Reported on its own because the fix is a setup one —
+                    # the Set B weights — not something wrong with the audio.
                     self.on_event("stt_no_international", utt_id=utt.utt_id,
                                   lang=res.get("lang"))
                 else:
@@ -207,7 +207,7 @@ class LLMStage(_Stage):
 
             try:
                 # Forwarded, not re-derived: STT identified this from the audio
-                # (and on the international path from Scribe), which the
+                # (and on the international path from Whisper), which the
                 # transcript alone cannot reproduce.
                 res = self.worker.run({
                     "utt_id": sent.utt_id,
@@ -245,7 +245,7 @@ class TTSStage(_Stage):
     """reply_queue -> wav_queue
 
     One stage, two voices. Which one speaks is decided inside the worker from
-    the reply's language, so nothing here has to know that ElevenLabs exists —
+    the reply's language, so nothing here has to know that MMS-TTS exists —
     a WAV comes back either way, and playback, barge-in and the echo guard
     treat an international reply exactly like a local one.
     """

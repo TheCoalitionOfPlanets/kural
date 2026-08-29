@@ -2,7 +2,7 @@
 #
 # Separate from the root venv because the two model stacks pin incompatible
 # CUDA torch builds (cu130 here, cu132 there). torch/torchvision come from the
-# PyTorch CUDA index in download.sh, not from this file.
+# PyTorch CUDA index, not from this file.
 transformers==5.15.0
 tokenizers==0.22.2
 huggingface_hub==1.28.0

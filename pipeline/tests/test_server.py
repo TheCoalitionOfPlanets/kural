@@ -52,7 +52,8 @@ class FakeWorker:
 
     def start(self, timeout_s=300):
         return {"event": "ready", "load_s": 0.0, "lid": True,
-                "elevenlabs": True, "vram_gb": 0.0}
+                "international_stt": True, "international_tts": True,
+                "vram_gb": 0.0}
 
     def run(self, payload):
         self.calls.append(payload)

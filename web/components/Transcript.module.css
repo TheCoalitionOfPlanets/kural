@@ -83,7 +83,7 @@
 }
 
 /* The only tag that costs money, so it is the only one that gets the accent. */
-.remote {
+.setB {
   border-color: color-mix(in srgb, var(--accent) 55%, transparent);
   background: var(--accent-wash);
   color: var(--accent);
