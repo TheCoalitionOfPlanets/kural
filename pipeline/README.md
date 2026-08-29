@@ -18,19 +18,24 @@ See [Reply language](#reply-language) and
 
 ## Running
 
+Build the environments and fetch the weights first — `bash setup.sh` from the
+repo root, or `setup.bat` on Windows. See
+[Running it](../README.md#running-it).
+
 Two front ends over the same pipeline.
 
 **Terminal** — the machine's own microphone and speakers:
 
-```bat
-venv\Scripts\python.exe pipeline\run_realtime.py
+```bash
+venv/bin/python pipeline/run_realtime.py            # Linux, macOS
+venv\Scripts\python.exe pipeline\run_realtime.py     # Windows
 ```
 
 **Browser** — a ChatGPT-voice-style interface, where the tab is the microphone
 and the speakers:
 
-```bat
-venv\Scripts\python.exe -m pipeline.server
+```bash
+venv/bin/python -m pipeline.server
 cd web && npm install && npm run dev
 ```
 
@@ -46,8 +51,8 @@ releases the mic.
 Verify capture and VAD alone first — it starts instantly and writes each
 detected utterance to `spill/` so you can listen and confirm segmentation:
 
-```bat
-venv\Scripts\python.exe pipeline\run_realtime.py --capture-only
+```bash
+venv/bin/python pipeline/run_realtime.py --capture-only
 ```
 
 ## Why subprocesses

@@ -17,6 +17,7 @@ Everything between those two is identical.
 """
 import queue
 import threading
+from pathlib import Path
 
 from .capture import CaptureThread
 from .echo_guard import RecentInput, RecentSpeech
@@ -36,6 +37,36 @@ _NESTED_PATH_KEYS = {
     "stt": ("lid", "whisper"),
     "tts": ("mms_tts",),
 }
+
+# Where a venv keeps its interpreter, on the two platforms this runs on.
+_VENV_LAYOUTS = (("Scripts", "python.exe"), ("bin", "python"))
+
+
+def venv_python(root, configured):
+    """Resolve a configured venv interpreter to the one that exists here.
+
+    realtime.yaml names the Windows layout (`venv/Scripts/python.exe`) because
+    that is where the pipeline was developed. The same venv on Linux and macOS
+    puts its interpreter at `venv/bin/python` instead. Keeping two configs, or
+    having setup rewrite the committed one, both mean the file on disk no
+    longer says what the project does — so both layouts are tried here and
+    whichever exists wins.
+
+    A path that matches neither is returned unchanged, so the failure surfaces
+    as Popen reporting the configured path rather than a substituted guess.
+    """
+    path = Path(configured)
+    if not path.is_absolute():
+        path = root / path
+    if path.exists():
+        return path
+    # <venv>/{Scripts,bin}/python* — two levels up is the venv itself.
+    venv_dir = path.parent.parent
+    for subdir, exe in _VENV_LAYOUTS:
+        candidate = venv_dir / subdir / exe
+        if candidate.exists():
+            return candidate
+    return path
 
 
 def spawn_worker(cfg, root, key, label, on_event=None, on_worker_log=None,
@@ -58,7 +89,7 @@ def spawn_worker(cfg, root, key, label, on_event=None, on_worker_log=None,
             section[sub] = block
     wp = WorkerProcess(
         name=label,
-        python=root / section["python"],
+        python=venv_python(root, section["python"]),
         script=root / section["worker"],
         config=section,
         cwd=root,

@@ -75,6 +75,87 @@ to send each utterance to the one that will do it better.
 
 ---
 
+## Running it
+
+### 1. Setup
+
+```bash
+bash setup.sh          # Linux, macOS
+```
+
+```bat
+setup.bat              REM Windows
+```
+
+That builds the three virtual environments, installs every package, downloads
+the weights and verifies the result. It is safe to re-run: every step checks for
+its own result first, so an interrupted run resumes where it stopped and a
+finished one is a no-op.
+
+Before the first run you need:
+
+* **Python 3.14 and Python 3.12.** The stacks pin incompatible CUDA torch
+  builds, so they cannot share an interpreter — see
+  [Layout](#layout). Point at them with `PYTHON_314` / `PYTHON_312` if they are
+  not on PATH.
+* **A C toolchain.** `webrtcvad` has no prebuilt wheel and compiles on install
+  — `build-essential` and the Python headers on Linux, Build Tools for Visual
+  Studio with the C++ workload on Windows.
+* **A Hugging Face token.** Two models are gated: accept the licence for
+  `google/gemma-3-4b-it` and request access to `ARTPARK-IISc/SraVaani-1.0`, then
+  `hf auth login` (or set `HF_TOKEN`).
+* **About 25 GB of disk**, and a 12 GB NVIDIA card to actually run it. Every
+  stage sets `require_cuda`.
+
+The setup finishes with a smoke test — each environment imports what its worker
+imports, the weights are where the config says, the reference clip is a shape
+the voice will accept, and CUDA is visible. Nothing is loaded onto the GPU, so
+it takes seconds.
+
+### 2. Start the pipeline
+
+```bash
+venv/bin/python pipeline/run_realtime.py                  # Linux, macOS
+venv\Scripts\python.exe pipeline\run_realtime.py           # Windows
+```
+
+Then talk. It listens continuously, answers out loud in the language you spoke,
+and can be interrupted mid-reply.
+
+To check the microphone and voice detection alone first — it starts instantly
+and loads no models:
+
+```bash
+venv/bin/python pipeline/run_realtime.py --capture-only
+```
+
+To use a browser as the microphone and speakers instead of the local ones, with
+the identical pipeline in between:
+
+```bash
+venv/bin/python -m pipeline.server
+```
+
+### The international stack is opt-in
+
+`setup.sh` fetches Set A only, because Set B ships suspended in
+[realtime.yaml](pipeline/config/realtime.yaml) — `stt.lid`, `stt.whisper` and
+`tts.mms_tts` are all `false`. Indian languages and English work fully without
+it.
+
+To turn it on, fetch the weights and flip those three flags:
+
+```bash
+bash setup.sh --with-set-b                       # ~6 GB more
+MMS_TTS_LANGS=spa,fra,jpn bash setup.sh --with-set-b   # pick the voices
+```
+
+MMS-TTS ships one checkpoint per language, so only the ones you expect are
+worth fetching. The codes are the ISO 639-3 keys of `MMS_TTS_VOICES` in
+[languages.py](pipeline/realtime/languages.py).
+
+---
+
 ## The router
 
 This is the part that makes the rest work.
@@ -358,18 +439,26 @@ upstream rather than accumulating a backlog.
 ## Layout
 
 ```
+setup.sh           one-shot setup: environments, packages, weights, smoke test
+setup.bat          the same, for Windows
+tools/             what both setup scripts share, so they cannot drift
 pipeline/
+  run_realtime.py  the entrypoint: microphone in, speakers out
   realtime/        capture, VAD, routing tables, echo guard, barge-in, session
   workers/         one subprocess per model stage
   config/          realtime.yaml and the system prompt
   server/          WebSocket front end
-stt/models/        SraVaani + the routing model
-tts/models/        Indic-Mio + its codec
+stt/models/        SraVaani, the router, and Whisper large-v3
+tts/models/        Indic-Mio, its codec, and the MMS-TTS voices
 tts/voice/         the reference clip that fixes the assistant's voice
 reasoning/models/  Gemma 3 4B
 web/               browser front end
 docs/voice.md      voice setup, language coverage, and past failure modes
 ```
+
+The three environments are built beside the code they host — `venv/` at the
+root, `reasoning/venv/` and `tts/venv/` next to their models — because the
+stacks pin incompatible CUDA torch builds and cannot share an interpreter.
 
 Two entrypoints share the identical graph and differ only at the ends:
 
