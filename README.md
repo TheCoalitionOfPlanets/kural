@@ -136,23 +136,77 @@ the identical pipeline in between:
 venv/bin/python -m pipeline.server
 ```
 
-### The international stack is opt-in
+### SraVaani only — turning the router off
 
-`setup.sh` fetches Set A only, because Set B ships suspended in
-[realtime.yaml](pipeline/config/realtime.yaml) — `stt.lid`, `stt.whisper` and
-`tts.mms_tts` are all `false`. Indian languages and English work fully without
-it.
+**This is how the repo ships.** The router and the whole international stack are
+already suspended in [realtime.yaml](pipeline/config/realtime.yaml), so a fresh
+clone runs SraVaani and Indic-Mio and nothing else. `setup.sh` fetches only
+those weights to match.
 
-To turn it on, fetch the weights and flip those three flags:
+Three flags control it, and **all three have to be `false`**:
+
+```yaml
+stt:
+  lid:
+    enabled: false       # the router: never classifies, never loads
+  whisper:
+    enabled: false       # the Set B ear: never loads
+tts:
+  mms_tts:
+    enabled: false       # the Set B voice: never loads
+```
+
+Turning off only the router is not enough, and this is the part that catches
+people. Routing has **two independent entry points**: STT picks the ear from the
+audio, and TTS picks the voice from the *reply's* language. Silence the router
+and a reply the model happens to produce in Spanish would still reach out for a
+Spanish voice. `tts.mms_tts` closes that second door.
+
+With all three off, every turn takes one path:
+
+```
+microphone → VAD → SraVaani → Gemma 3 4B → Indic-Mio → speaker
+```
+
+No language classification runs at all — `decide()` returns "local" before the
+model is ever consulted, so the router costs nothing rather than being loaded
+and ignored. STT reports no language, and the reply language is detected from
+the transcript instead, which is what the pipeline did before the router
+existed.
+
+Startup says so plainly, and these three lines are the confirmation that the
+router really is off:
+
+```
+! language ID off (disabled in config) — every turn routes to the local Indic models
+! international stt off (disabled in config) — cannot transcribe languages outside the local set
+! international tts off (disabled in config) — cannot speak languages outside the local set
+```
+
+What you give up is only what Set A never covered: speech in Spanish, Russian,
+Japanese and the rest is transcribed by an Indic model that has never heard it,
+which produces confident nonsense rather than an error. **Urdu and Kashmiri are
+the two that quietly regress** — SraVaani's model card excludes both, and with
+the router off they no longer reach an ear that can hear them. Everything else
+in [Set A](#set-a--23-languages) is unaffected: 23 languages, entirely local.
+
+Nothing is deleted by turning it off. Re-enabling is the three flags above.
+
+### Turning the international stack on
+
+Fetch the Set B weights, then set those same three flags to `true`:
 
 ```bash
-bash setup.sh --with-set-b                       # ~6 GB more
+bash setup.sh --with-set-b                             # ~6 GB more
 MMS_TTS_LANGS=spa,fra,jpn bash setup.sh --with-set-b   # pick the voices
 ```
 
 MMS-TTS ships one checkpoint per language, so only the ones you expect are
 worth fetching. The codes are the ISO 639-3 keys of `MMS_TTS_VOICES` in
 [languages.py](pipeline/realtime/languages.py).
+
+`setup.sh` cross-checks the two: a flag set to `true` whose weights are missing
+is reported as a failure rather than left to surface mid-sentence.
 
 ---
 
@@ -487,6 +541,12 @@ guard — is the same code.
 together. Set A and Set B are never both needed for the same turn, so the Set B
 models are loaded on demand rather than held alongside their Set A counterparts;
 holding all six at once would come to roughly 11 GB.
+
+As the repo ships the router is suspended
+([SraVaani only](#sravaani-only--turning-the-router-off)), which drops the
+resident set to SraVaani, Gemma and Indic-Mio — **≈ 5.8 GB**. The router is the
+second-largest model here, so turning it off is the single biggest VRAM saving
+available short of dropping a stage.
 
 Precision matters most at the router. It is the second-largest model in the
 pipeline and its entire output is one argmax plus a probability sum, so nothing
